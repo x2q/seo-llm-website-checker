@@ -16,6 +16,7 @@ import re
 import socket
 import ssl
 import sys
+import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
@@ -258,21 +259,28 @@ def _tls_probe(host: str, port: int = 443, timeout: float = 6.0) -> dict:
 
 def _tls_version_accepted(host: str, port: int, version: ssl.TLSVersion,
                           timeout: float = 4.0) -> bool:
-    """True if the server accepts a connection restricted to exactly this TLS version."""
-    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-    ctx.check_hostname = False
-    ctx.verify_mode = ssl.CERT_NONE
-    try:
-        ctx.minimum_version = version
-        ctx.maximum_version = version
-    except ValueError:
-        return False
-    try:
-        with socket.create_connection((host, port), timeout=timeout) as sock:
-            with ctx.wrap_socket(sock, server_hostname=host):
-                return True
-    except (ssl.SSLError, OSError, socket.timeout):
-        return False
+    """True if the server accepts a connection restricted to exactly this TLS version.
+
+    Probing deprecated versions (1.0/1.1) is intentional — we want to know if
+    the server still accepts them. Python rightly warns on using those constants,
+    so we silence the warning in this one call site.
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", DeprecationWarning)
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        try:
+            ctx.minimum_version = version
+            ctx.maximum_version = version
+        except (ValueError, ssl.SSLError):
+            return False
+        try:
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host):
+                    return True
+        except (ssl.SSLError, OSError, socket.timeout):
+            return False
 
 
 def check_tls_cert_expiry(s: Site) -> CheckResult:
