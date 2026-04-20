@@ -24,23 +24,34 @@ Audited **50** URL(s).
 Site-wide: ✅ 13 pass · 🟡 4 warn · 🔴 1 fail · ℹ️ 4 info
 
 ## Site-wide checks
-[tables per category — TLS, DNS, robots.txt, email records, sitemap, …]
+[markdown tables per category — TLS, DNS, robots.txt, email, sitemap, …]
 
 ## Per-URL issues (WARN + FAIL only)
-| URL | Check | Status | Detail |
+URL                                    Status   Check                  Detail
+-----------------------------------------------------------------------------------
+https://www.example.com/               🔴 FAIL  images_alt             4/9 missing alt (44%)
+https://www.example.com/               🔴 FAIL  compression            HTML 45 KB served uncompressed
+https://www.example.com/about          🟡 WARN  meta_description       length 210 (>160)
+https://www.example.com/blog/post-1    🔴 FAIL  images_alt             3/8 missing alt (37%)
 ...
 
 ## Per-URL summary
-| URL | ✅ | 🟡 | 🔴 | ℹ️ |
+URL                                      ✅   🟡   🔴   ℹ️
+----------------------------------------------------------
+https://www.example.com/                 45   13    7    6
+https://www.example.com/about            47   13    6    5
+https://www.example.com/blog/post-1      48   12    5    5
 ...
 
 **Aggregate:** ✅ 2415 pass · 🟡 210 warn · 🔴 85 fail · ℹ️ 100 info across site-wide + 50 URL(s)
 ```
 
+Per-URL tables use fixed-width monospace blocks (URL column padded to the longest URL, counts right-aligned) so everything lines up in any renderer.
+
 Live progress bar on stderr while running (auto-hides for pipes/CI):
 
 ```
-[█████████████░░░░░░░░░░░░░░░] 128/320 40%  ✅ canonical (page 3/50)
+[█████████████░░░░░░░░░░░░░░░] 128/320 40%  ✅ canonical
 ```
 
 ## Flags
