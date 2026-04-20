@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import socket
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict
 from typing import Callable, Iterable, Optional
 from urllib.parse import urljoin, urlparse, urlunparse, quote
@@ -73,6 +75,8 @@ class Site:
     soup: BeautifulSoup
     robots_text: Optional[str]
     robots_content_type: Optional[str]
+    robots_status: Optional[int]
+    robots_url: str
     session: requests.Session
 
 
@@ -102,6 +106,122 @@ def check_https_reachable(s: Site) -> CheckResult:
         PASS if ok else FAIL,
         f"{s.response.status_code} on {s.final_url}",
     )
+
+
+def _dns_families(host: str) -> tuple[bool, bool, Optional[str]]:
+    """Return (has_ipv4, has_ipv6, error)."""
+    has_v4 = has_v6 = False
+    try:
+        for info in socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM):
+            fam = info[0]
+            if fam == socket.AF_INET:
+                has_v4 = True
+            elif fam == socket.AF_INET6:
+                has_v6 = True
+    except socket.gaierror as e:
+        return False, False, str(e)
+    return has_v4, has_v6, None
+
+
+def _tcp_ok(host: str, port: int, family: int, timeout: float = 4.0) -> Optional[str]:
+    """Try TCP connect via the given address family. Returns None on success, else error."""
+    try:
+        infos = socket.getaddrinfo(host, port, family=family, type=socket.SOCK_STREAM)
+    except socket.gaierror as e:
+        return f"DNS: {e}"
+    last_err = "no address returned"
+    for info in infos:
+        try:
+            with socket.socket(info[0], info[1]) as sock:
+                sock.settimeout(timeout)
+                sock.connect(info[4])
+                return None
+        except OSError as e:
+            last_err = str(e)
+    return last_err
+
+
+def check_dual_stack_host(s: Site) -> CheckResult:
+    """Primary host resolves (and connects) via IPv4 and IPv6."""
+    parsed = urlparse(s.final_url)
+    host = parsed.hostname or ""
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    v4, v6, err = _dns_families(host)
+    if err:
+        return CheckResult("dual_stack_host", "shared", FAIL,
+                           f"DNS error for {host}: {err}")
+    if not v4:
+        return CheckResult("dual_stack_host", "shared", FAIL,
+                           f"{host} has no A record — IPv4 users can't reach it")
+    v4_err = _tcp_ok(host, port, socket.AF_INET)
+    if v4_err:
+        return CheckResult("dual_stack_host", "shared", FAIL,
+                           f"{host} A record resolves but IPv4 TCP failed: {v4_err}")
+    if not v6:
+        return CheckResult("dual_stack_host", "shared", WARN,
+                           f"{host} IPv4-only (no AAAA record) — IPv6-only clients "
+                           "(mobile carriers, enterprise networks) cannot reach it")
+    v6_err = _tcp_ok(host, port, socket.AF_INET6)
+    if v6_err:
+        return CheckResult("dual_stack_host", "shared", WARN,
+                           f"{host} has AAAA but IPv6 TCP failed: {v6_err} "
+                           "(may be local network — DNS is the authoritative signal)")
+    return CheckResult("dual_stack_host", "shared", PASS,
+                       f"{host} reachable via IPv4 + IPv6 on :{port}")
+
+
+def _collect_asset_hosts(s: Site) -> set[str]:
+    """Unique hostnames referenced by <img>, <script>, <link>, <iframe>, <source>, <video>, <audio>."""
+    hosts: set[str] = set()
+    specs = [("img", "src"), ("script", "src"), ("link", "href"),
+             ("iframe", "src"), ("video", "src"), ("audio", "src"),
+             ("source", "src"), ("source", "srcset")]
+    for tag, attr in specs:
+        for el in s.soup.find_all(tag):
+            v = (el.get(attr) or "").strip()
+            if not v:
+                continue
+            # srcset has multiple URLs separated by commas; just take the first
+            if attr == "srcset":
+                v = v.split(",")[0].strip().split()[0]
+            url = urljoin(s.final_url, v)
+            p = urlparse(url)
+            if p.scheme in ("http", "https") and p.hostname:
+                hosts.add(p.hostname)
+    return hosts
+
+
+def check_dual_stack_assets(s: Site) -> CheckResult:
+    """Every referenced third-party asset host resolves via IPv4 + IPv6."""
+    hosts = _collect_asset_hosts(s)
+    primary = urlparse(s.final_url).hostname
+    hosts.discard(primary or "")
+    if not hosts:
+        return CheckResult("dual_stack_assets", "shared", INFO,
+                           "no third-party asset hosts on page")
+
+    def probe(h: str) -> tuple[str, bool, bool, Optional[str]]:
+        v4, v6, err = _dns_families(h)
+        return h, v4, v6, err
+
+    results: list[tuple[str, bool, bool, Optional[str]]] = []
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        for r in ex.map(probe, sorted(hosts)):
+            results.append(r)
+
+    broken = [(h, e) for h, v4, v6, e in results if e or not v4]
+    v6_missing = [h for h, v4, v6, e in results if v4 and not v6 and not e]
+
+    if broken:
+        return CheckResult("dual_stack_assets", "shared", FAIL,
+                           f"{len(broken)}/{len(results)} asset host(s) IPv4-broken: "
+                           f"{broken[0][0]} ({broken[0][1] or 'no A record'})")
+    if v6_missing:
+        return CheckResult("dual_stack_assets", "shared", WARN,
+                           f"{len(v6_missing)}/{len(results)} asset host(s) lack IPv6 (AAAA): "
+                           f"{', '.join(v6_missing[:3])}")
+    return CheckResult("dual_stack_assets", "shared", PASS,
+                       f"{len(results)} asset host(s) all dual-stack (A + AAAA)")
 
 
 def check_http_to_https(s: Site) -> CheckResult:
@@ -478,24 +598,98 @@ def check_hreflang(s: Site) -> CheckResult:
     return CheckResult("hreflang", "seo", PASS, ", ".join(langs))
 
 
+VALID_ROBOTS_DIRECTIVES = {
+    "user-agent", "disallow", "allow", "sitemap", "crawl-delay",
+    "host", "noindex",  # noindex is deprecated but still encountered
+}
+
+
 def check_robots_txt(s: Site) -> CheckResult:
-    if s.robots_text is None:
-        return CheckResult("robots_txt_present", "shared", FAIL,
-                           "GET /robots.txt failed or non-200")
-    if s.robots_content_type and not s.robots_content_type.lower().startswith("text/plain"):
-        return CheckResult("robots_txt_present", "shared", WARN,
-                           f"served as {s.robots_content_type!r} (want text/plain) — crawlers may ignore")
-    # must parse into at least one group with a User-agent
-    groups = _parse_robots_groups(s.robots_text)
+    """Status code + Content-Type + parseability + syntax sanity of /robots.txt.
+
+    robots.txt is optional (absent = allow-all); but if present, it must be
+    served correctly or crawlers ignore it.
+    """
+    # --- 1. status code ---
+    if s.robots_status is None:
+        return CheckResult("robots_txt", "shared", FAIL,
+                           f"GET {s.robots_url} failed (network error)")
+    if s.robots_status == 404:
+        return CheckResult("robots_txt", "shared", INFO,
+                           f"404 {s.robots_url} — no robots.txt (defaults to allow-all)")
+    if s.robots_status >= 500:
+        return CheckResult("robots_txt", "shared", FAIL,
+                           f"{s.robots_status} server error on {s.robots_url} — "
+                           "Google treats 5xx as full block")
+    if s.robots_status != 200:
+        return CheckResult("robots_txt", "shared", FAIL,
+                           f"{s.robots_status} on {s.robots_url}")
+
+    # --- 2. Content-Type ---
+    ct = (s.robots_content_type or "").lower().split(";")[0].strip()
+    ct_issues = []
+    if not ct:
+        ct_issues.append("no Content-Type header")
+    elif ct != "text/plain":
+        ct_issues.append(f"Content-Type={ct!r} (want text/plain)")
+
+    # --- 3. content / syntax ---
+    text = s.robots_text or ""
+    if not text.strip():
+        return CheckResult("robots_txt", "shared", FAIL,
+                           "200 but empty body — crawlers may treat as allow-all or error")
+    syntax_issues: list[str] = []
+    if text.startswith("\ufeff"):
+        syntax_issues.append("BOM at start")
+    if "\r\n" in text:
+        syntax_issues.append("Windows (CRLF) line endings")
+    # unknown directives and rules-before-user-agent
+    saw_user_agent = False
+    unknown: list[str] = []
+    rule_before_ua: list[str] = []
+    for raw in text.splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line or ":" not in line:
+            continue
+        key = line.split(":", 1)[0].strip().lower()
+        if key == "user-agent":
+            saw_user_agent = True
+            continue
+        if key not in VALID_ROBOTS_DIRECTIVES:
+            if key not in unknown:
+                unknown.append(key)
+            continue
+        if key in ("disallow", "allow") and not saw_user_agent:
+            rule_before_ua.append(key)
+    if unknown:
+        syntax_issues.append(f"unknown directive(s): {', '.join(unknown[:3])}")
+    if rule_before_ua:
+        syntax_issues.append(f"{rule_before_ua[0]} before any User-agent — ignored")
+
+    # parseable?
+    groups = _parse_robots_groups(text)
     if not any(agents for agents, _ in groups):
-        return CheckResult("robots_txt_present", "shared", FAIL,
-                           "robots.txt has no User-agent lines — unparseable")
-    has_sitemap = bool(re.search(r"(?im)^\s*sitemap\s*:", s.robots_text))
+        return CheckResult("robots_txt", "shared", FAIL,
+                           "no User-agent lines — file is unparseable")
+
+    has_sitemap = bool(re.search(r"(?im)^\s*sitemap\s*:", text))
+
+    # aggregate verdict
+    if ct_issues:
+        # bad Content-Type → Google may refuse to use the file at all
+        return CheckResult("robots_txt", "shared", WARN,
+                           f"200 + parses ({len(groups)} groups); "
+                           f"{ct_issues[0]} — crawlers may ignore")
+    if syntax_issues:
+        return CheckResult("robots_txt", "shared", WARN,
+                           f"200 text/plain, {len(groups)} groups; "
+                           f"issues: {'; '.join(syntax_issues)}")
     if not has_sitemap:
-        return CheckResult("robots_txt_present", "shared", WARN,
-                           f"parses ({len(groups)} groups) but no Sitemap: line")
-    return CheckResult("robots_txt_present", "shared", PASS,
-                       f"parses ({len(groups)} groups), has Sitemap:")
+        return CheckResult("robots_txt", "shared", WARN,
+                           f"200 text/plain, {len(groups)} groups — "
+                           "no Sitemap: line (add to help crawlers discover your URLs)")
+    return CheckResult("robots_txt", "shared", PASS,
+                       f"200 text/plain, {len(groups)} groups, Sitemap: present")
 
 
 def _sitemap_url(s: Site) -> str:
@@ -1402,6 +1596,7 @@ CHECKS: list[CheckFn] = [
     # shared
     check_https_reachable, check_url_status, check_url_not_redirected, check_redirect_chain,
     check_http_to_https, check_www_apex, check_hsts,
+    check_dual_stack_host, check_dual_stack_assets,
     check_content_type, check_x_robots, check_doctype, check_meta_charset_early,
     check_mixed_content, check_security_headers, check_meta_refresh,
     check_robots_txt, check_googlebot_allowed,
@@ -1431,16 +1626,18 @@ def build_site(url: str) -> Site:
     r = fetch(session, url)
     soup = BeautifulSoup(r.text, "html.parser")
     robots_url = urljoin(root_url(r.url), "/robots.txt")
-    robots, robots_ct = None, None
+    robots, robots_ct, robots_status = None, None, None
     try:
         rr = fetch(session, robots_url)
+        robots_status = rr.status_code
+        robots_ct = rr.headers.get("Content-Type")
         if rr.status_code == 200:
             robots = rr.text
-            robots_ct = rr.headers.get("Content-Type")
     except requests.RequestException:
         pass
     return Site(url=url, final_url=r.url, response=r, soup=soup,
-                robots_text=robots, robots_content_type=robots_ct, session=session)
+                robots_text=robots, robots_content_type=robots_ct,
+                robots_status=robots_status, robots_url=robots_url, session=session)
 
 
 class ProgressBar:
