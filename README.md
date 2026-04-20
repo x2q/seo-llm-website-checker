@@ -1,6 +1,6 @@
 # seo-llm-website-checker
 
-Single-file Python CLI that runs ~50 checks on a live website and reports SEO + LLM-readiness issues as a markdown table (or JSON). Covers the same ground as a single-page Ahrefs / Screaming Frog / Sitebulb / Lighthouse audit — slow pages, broken links, redirect chains, canonical/sitemap hygiene, oversized assets, mixed content, security headers, DOM size, modern image formats, plus LLM-specific signals (`llms.txt`, AI crawler access, citable facts). No headless browser — just HTTP + HTML parsing.
+Single-file Python CLI that runs ~60 checks on a live website and reports SEO + LLM-readiness issues as a markdown table (or JSON). Covers the same ground as a single-page Ahrefs / Screaming Frog / Sitebulb / Lighthouse / Google Search Console audit — slow pages, broken links, redirect chains, canonical/sitemap hygiene, oversized assets, mixed content, security headers, DOM size, modern image formats, Googlebot crawlability, soft-404 detection, plus LLM-specific signals (`llms.txt`, AI crawler access, citable facts). No headless browser — just HTTP + HTML parsing.
 
 ## Install
 
@@ -24,6 +24,10 @@ python check.py https://example.com --fail-on warn   # exit 1 on any WARN or FAI
 ### Shared / transport
 
 - HTTPS reachable, HTTP → HTTPS redirect, HSTS header
+- **URL status class** — explicitly flag 404, 403, 5xx, 4xx (GSC will refuse to index)
+- **URL not redirected** — if the input URL itself 30xs, say so (Google indexes the target)
+- **Redirect chain length** — WARN >1 hop, FAIL >4 (GSC "Redirect error")
+- **Googlebot allowed** — path-aware robots.txt matching (longest-pattern-wins, `$` end-anchor, `*` wildcard) for the audited URL (GSC "Blocked by robots.txt")
 - www ↔ apex canonicalization (redirect direction must match the `<link rel=canonical>`)
 - `Content-Type` + charset, no `X-Robots-Tag: noindex`
 - **`<!DOCTYPE html>` present** (Lighthouse, Screaming Frog)
@@ -39,6 +43,8 @@ python check.py https://example.com --fail-on warn   # exit 1 on any WARN or FAI
 - `<link rel=canonical>` present, absolute https, matches the fetched URL (path percent-encoded)
 - **Canonical URL itself returns 200 directly** (doesn't redirect — the Ahrefs "canonical points to redirect" check)
 - **`<meta name="robots">` + `X-Robots-Tag` — page is indexable** (FAIL on `noindex`, WARN on `nofollow`)
+- **Page indexable by Google (composite)** — rolls up status, robots meta/header, canonical direction, and robots.txt into one "will Google index this?" verdict
+- **Soft 404 detection** — 200 response whose title/H1 says "not found"/"ikke fundet" with thin content
 - Single non-empty `<h1>`, `<html lang>` (warns if `.dk` site isn't `da`)
 - `<meta name=viewport>` with `width=device-width`
 - **Viewport doesn't disable zoom** (`user-scalable=no` / `maximum-scale=1` — accessibility issue)

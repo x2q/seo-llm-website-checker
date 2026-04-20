@@ -774,6 +774,57 @@ def _bot_allowed(bot: str, groups) -> Optional[bool]:
     return None
 
 
+def _robots_pattern_to_regex(pattern: str) -> str:
+    """Convert a robots.txt Disallow/Allow value to a regex (Google's spec)."""
+    end_anchor = pattern.endswith("$")
+    if end_anchor:
+        pattern = pattern[:-1]
+    parts = []
+    for ch in pattern:
+        if ch == "*":
+            parts.append(".*")
+        else:
+            parts.append(re.escape(ch))
+    regex = "^" + "".join(parts) + ("$" if end_anchor else "")
+    return regex
+
+
+def _path_allowed_for(bot: str, path: str, groups) -> tuple[bool, Optional[tuple[str, str]]]:
+    """Is this path crawlable by bot per robots.txt? Returns (allowed, matched_rule).
+
+    Follows Google's spec: longest-matching rule wins; Allow beats Disallow on ties.
+    Falls back to * group when no bot-specific group exists.
+    """
+    group_rules: list[tuple[str, str]] = []
+    star_rules: list[tuple[str, str]] = []
+    for agents, rules in groups:
+        lowered = [a.lower() for a in agents]
+        if bot.lower() in lowered:
+            group_rules = rules
+            break
+        if "*" in lowered:
+            star_rules = rules
+    rules = group_rules or star_rules
+    if not rules:
+        return True, None
+    best: Optional[tuple[int, str, str, str]] = None  # (length, kind, pattern, path)
+    for kind, pattern in rules:
+        if not pattern:
+            continue
+        try:
+            if re.search(_robots_pattern_to_regex(pattern), path):
+                score = len(pattern)
+                # Allow beats Disallow at equal length
+                if best is None or score > best[0] or (score == best[0] and kind == "allow"):
+                    best = (score, kind, pattern, path)
+        except re.error:
+            continue
+    if best is None:
+        return True, None
+    allowed = best[1] == "allow"
+    return allowed, (best[1], best[2])
+
+
 def check_ai_crawlers(s: Site) -> CheckResult:
     if s.robots_text is None:
         return CheckResult("ai_crawlers_allowed", "llm", INFO,
@@ -870,6 +921,143 @@ def check_lcp_hints(s: Site) -> CheckResult:
 
 
 # --------- runner ---------
+
+# ---------- Google Search Console "why pages aren't indexed" translations ----------
+
+def check_url_status(s: Site) -> CheckResult:
+    """Flag the HTTP status class of the audited URL (404/5xx/403 prevent indexing)."""
+    code = s.response.status_code
+    if code == 200:
+        return CheckResult("url_status", "shared", PASS, f"200 {s.final_url}")
+    if code == 403:
+        return CheckResult("url_status", "shared", FAIL,
+                           f"403 Forbidden — GSC will show 'Blocked due to access forbidden'")
+    if code == 404:
+        return CheckResult("url_status", "shared", FAIL,
+                           f"404 Not Found — GSC will show 'Not found (404)'")
+    if 500 <= code < 600:
+        return CheckResult("url_status", "shared", FAIL,
+                           f"{code} Server Error — GSC will show 'Server error (5xx)'")
+    if 400 <= code < 500:
+        return CheckResult("url_status", "shared", FAIL,
+                           f"{code} — GSC will show 'Blocked due to other 4xx issue'")
+    return CheckResult("url_status", "shared", WARN, f"{code} {s.final_url}")
+
+
+def check_url_not_redirected(s: Site) -> CheckResult:
+    """If input URL redirected, flag it — Google indexes the target, not the input URL."""
+    if not s.response.history:
+        return CheckResult("url_not_redirected", "shared", PASS,
+                           "audited URL returned final content directly")
+    hops = len(s.response.history)
+    first = s.response.history[0]
+    return CheckResult("url_not_redirected", "shared", INFO,
+                       f"{hops} redirect hop(s): {first.url} → … → {s.final_url}")
+
+
+def check_redirect_chain(s: Site) -> CheckResult:
+    """Flag redirect chains — Google gives up after too many hops."""
+    history = s.response.history
+    if len(history) == 0:
+        return CheckResult("redirect_chain", "shared", PASS, "no redirect")
+    if len(history) == 1:
+        return CheckResult("redirect_chain", "shared", PASS, "1 redirect hop")
+    if len(history) >= 5:
+        return CheckResult("redirect_chain", "shared", FAIL,
+                           f"{len(history)} hops — GSC 'Redirect error'")
+    if len(history) >= 3:
+        return CheckResult("redirect_chain", "shared", WARN,
+                           f"{len(history)} hops — reduce to 1 if possible")
+    return CheckResult("redirect_chain", "shared", WARN,
+                       f"{len(history)} hops")
+
+
+def check_googlebot_allowed(s: Site) -> CheckResult:
+    """Can Googlebot crawl THIS URL per robots.txt? (Path-aware, not blanket)."""
+    if s.robots_text is None:
+        return CheckResult("googlebot_allowed", "shared", INFO,
+                           "no robots.txt — defaults to allow-all")
+    path = urlparse(s.final_url).path or "/"
+    groups = _parse_robots_groups(s.robots_text)
+    allowed, matched = _path_allowed_for("Googlebot", path, groups)
+    if allowed:
+        if matched:
+            return CheckResult("googlebot_allowed", "shared", PASS,
+                               f"Googlebot allowed ({matched[0]}: {matched[1]})")
+        return CheckResult("googlebot_allowed", "shared", PASS,
+                           "Googlebot allowed (no matching rule)")
+    return CheckResult("googlebot_allowed", "shared", FAIL,
+                       f"Googlebot blocked by robots.txt ({matched[0]}: {matched[1]}) — "
+                       f"GSC 'Blocked by robots.txt'")
+
+
+def check_soft_404(s: Site) -> CheckResult:
+    """200 response with 404-like content — GSC 'Soft 404'."""
+    if s.response.status_code != 200:
+        return CheckResult("soft_404", "seo", INFO,
+                           f"status {s.response.status_code} (not 200)")
+    copy = BeautifulSoup(s.response.text, "html.parser")
+    for t in copy(["script", "style", "noscript"]):
+        t.decompose()
+    text = copy.get_text(" ", strip=True)
+    words = len(text.split())
+    title = s.soup.title.string.lower() if s.soup.title and s.soup.title.string else ""
+    h1 = s.soup.find("h1")
+    h1_text = h1.get_text(" ", strip=True).lower() if h1 else ""
+    body = text.lower()
+    indicators = [
+        "404", "page not found", "not found",
+        "siden findes ikke", "siden kunne ikke findes", "ikke fundet",
+        "sidan finns inte", "ikke eksisterer",
+        "the page you are looking for",
+    ]
+    hot_fields = f"{title} {h1_text}"
+    title_hit = any(ind in hot_fields for ind in indicators)
+    body_hit = any(ind in body for ind in indicators)
+    if title_hit and words < 300:
+        return CheckResult("soft_404", "seo", FAIL,
+                           f"title/h1 says 'not found' + {words} words — looks like soft 404")
+    if body_hit and words < 80:
+        return CheckResult("soft_404", "seo", WARN,
+                           f"'not found'-style text + only {words} words")
+    return CheckResult("soft_404", "seo", PASS, f"{words} words, no soft-404 indicators")
+
+
+def check_indexability_composite(s: Site) -> CheckResult:
+    """Roll-up: is this URL eligible to be indexed by Google?"""
+    blockers: list[str] = []
+    if s.response.status_code != 200:
+        blockers.append(f"status {s.response.status_code}")
+    # meta robots noindex / X-Robots-Tag
+    m = s.soup.find("meta", attrs={"name": re.compile("^robots$", re.I)})
+    content = (m.get("content") or "").lower() if m else ""
+    header = s.response.headers.get("X-Robots-Tag", "").lower()
+    if "noindex" in content or "noindex" in header:
+        blockers.append("noindex directive")
+    # canonical pointing elsewhere
+    link = s.soup.find("link", rel=lambda v: v and "canonical" in v)
+    href = (link.get("href") or "").strip() if link else ""
+    if href:
+        normalized = percent_encode_path(href).rstrip("/")
+        current = percent_encode_path(s.final_url).rstrip("/")
+        if normalized != current:
+            blockers.append(f"canonical points to {href}")
+    # robots.txt
+    if s.robots_text:
+        path = urlparse(s.final_url).path or "/"
+        groups = _parse_robots_groups(s.robots_text)
+        allowed, matched = _path_allowed_for("Googlebot", path, groups)
+        if not allowed:
+            blockers.append(f"robots.txt {matched[0]}:{matched[1]}")
+    if not blockers:
+        return CheckResult("page_indexable_by_google", "seo", PASS,
+                           "no noindex, canonical=self, robots allows, status 200")
+    if any("noindex" in b or "status" in b or "robots.txt" in b for b in blockers):
+        return CheckResult("page_indexable_by_google", "seo", FAIL,
+                           f"won't be indexed: {'; '.join(blockers)}")
+    return CheckResult("page_indexable_by_google", "seo", WARN,
+                       f"alternate/canonical elsewhere: {'; '.join(blockers)}")
+
 
 # ---------- new checks (Ahrefs / Screaming Frog / Sitebulb / Lighthouse coverage) ----------
 
@@ -1127,13 +1315,15 @@ CheckFn = Callable[[Site], CheckResult]
 
 CHECKS: list[CheckFn] = [
     # shared
-    check_https_reachable, check_http_to_https, check_www_apex, check_hsts,
+    check_https_reachable, check_url_status, check_url_not_redirected, check_redirect_chain,
+    check_http_to_https, check_www_apex, check_hsts,
     check_content_type, check_x_robots, check_doctype, check_meta_charset_early,
     check_mixed_content, check_security_headers, check_meta_refresh,
-    check_robots_txt,
+    check_robots_txt, check_googlebot_allowed,
     # seo
     check_title, check_meta_description, check_canonical, check_canonical_not_redirect,
-    check_meta_robots_indexable, check_h1, check_html_lang,
+    check_meta_robots_indexable, check_indexability_composite, check_soft_404,
+    check_h1, check_html_lang,
     check_viewport, check_viewport_scalable,
     check_favicon, check_apple_touch_icon, check_images_alt, check_open_graph,
     check_twitter_card, check_json_ld, check_hreflang,
