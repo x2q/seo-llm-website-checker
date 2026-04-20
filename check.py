@@ -82,6 +82,7 @@ class Site:
     robots_url: str
     session: requests.Session
     tls_info: Optional[dict] = None
+    browser_result: Optional[dict] = None
 
 
 # --------- helpers ---------
@@ -690,6 +691,224 @@ def check_compression(s: Site) -> CheckResult:
                            f"only legacy compression: {', '.join(parts)} — enable brotli (~15–20% smaller)")
     return CheckResult("compression", "perf", WARN,
                        f"compression supported: {', '.join(parts)}")
+
+
+# ---------- Headless-browser runtime checks (--browser) ----------
+
+
+def run_browser_audit(url: str, timeout_ms: int = 30000) -> dict:
+    """Load the page in headless Chromium and collect runtime observations.
+
+    Returns a dict with: console_errors, console_warnings, page_errors,
+    failed_requests, load_time_ms, dom_content_loaded_ms, fcp_ms, lcp_ms, cls.
+    Empty dict with 'error' key on failure.
+    """
+    try:
+        from playwright.sync_api import sync_playwright
+    except ImportError:
+        return {"error": "playwright not installed — run: pip install -r requirements-browser.txt && playwright install chromium"}
+
+    console_errors: list[dict] = []
+    console_warnings: list[dict] = []
+    page_errors: list[str] = []
+    failed_requests: list[dict] = []
+
+    try:
+        with sync_playwright() as p:
+            try:
+                browser = p.chromium.launch(headless=True)
+            except Exception as e:
+                return {"error": f"could not launch chromium — run: playwright install chromium ({e})"}
+            context = browser.new_context(
+                user_agent=DESKTOP_UA,
+                viewport={"width": 1350, "height": 940},
+            )
+            page = context.new_page()
+
+            page.on("console", lambda msg: (
+                console_errors if msg.type == "error" else console_warnings
+            ).append({"text": msg.text[:200], "location": str(msg.location)})
+                if msg.type in ("error", "warning") else None)
+            page.on("pageerror", lambda err: page_errors.append(str(err)[:300]))
+            page.on("requestfailed", lambda req: failed_requests.append({
+                "url": req.url[:200],
+                "failure": (req.failure or "unknown")[:100],
+                "method": req.method,
+            }))
+
+            # install LCP + CLS observers BEFORE navigation
+            init_script = """
+                window.__webvitals = { lcp: 0, cls: 0 };
+                new PerformanceObserver((list) => {
+                    const entries = list.getEntries();
+                    const last = entries[entries.length - 1];
+                    if (last) window.__webvitals.lcp = last.startTime;
+                }).observe({ type: 'largest-contentful-paint', buffered: true });
+                new PerformanceObserver((list) => {
+                    for (const e of list.getEntries()) {
+                        if (!e.hadRecentInput) window.__webvitals.cls += e.value;
+                    }
+                }).observe({ type: 'layout-shift', buffered: true });
+            """
+            context.add_init_script(init_script)
+
+            try:
+                response = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+            except Exception as e:
+                browser.close()
+                return {"error": f"navigation failed: {e}"}
+
+            # allow a moment for observers to settle
+            page.wait_for_timeout(500)
+
+            metrics = page.evaluate("""() => {
+                const nav = performance.getEntriesByType('navigation')[0] || {};
+                const paint = performance.getEntriesByType('paint');
+                const fcp = paint.find(p => p.name === 'first-contentful-paint');
+                return {
+                    domContentLoaded: nav.domContentLoadedEventEnd || 0,
+                    loadComplete: nav.loadEventEnd || 0,
+                    fcp: fcp ? fcp.startTime : 0,
+                    lcp: (window.__webvitals && window.__webvitals.lcp) || 0,
+                    cls: (window.__webvitals && window.__webvitals.cls) || 0,
+                };
+            }""")
+
+            status = response.status if response else None
+            browser.close()
+    except Exception as e:
+        return {"error": f"playwright error: {e}"}
+
+    return {
+        "status": status,
+        "console_errors": console_errors,
+        "console_warnings": console_warnings,
+        "page_errors": page_errors,
+        "failed_requests": failed_requests,
+        "dom_content_loaded_ms": int(metrics.get("domContentLoaded") or 0),
+        "load_complete_ms": int(metrics.get("loadComplete") or 0),
+        "fcp_ms": int(metrics.get("fcp") or 0),
+        "lcp_ms": int(metrics.get("lcp") or 0),
+        "cls": float(metrics.get("cls") or 0),
+    }
+
+
+def _br(s: Site) -> Optional[dict]:
+    """Browser audit dict, or None if --browser wasn't enabled."""
+    return s.browser_result
+
+
+def check_browser_js_errors(s: Site) -> CheckResult:
+    br = _br(s)
+    if br is None:
+        return CheckResult("browser_js_errors", "browser", INFO, "browser mode off (run with --browser)")
+    if br.get("error"):
+        return CheckResult("browser_js_errors", "browser", FAIL, br["error"])
+    errs = br.get("page_errors", [])
+    if not errs:
+        return CheckResult("browser_js_errors", "browser", PASS, "no uncaught JS exceptions")
+    return CheckResult("browser_js_errors", "browser", FAIL,
+                       f"{len(errs)} uncaught JS exception(s): {errs[0][:120]}")
+
+
+def check_browser_console_errors(s: Site) -> CheckResult:
+    br = _br(s)
+    if br is None:
+        return CheckResult("browser_console_errors", "browser", INFO, "browser mode off")
+    if br.get("error"):
+        return CheckResult("browser_console_errors", "browser", INFO, "browser failed")
+    errs = br.get("console_errors", [])
+    warns = br.get("console_warnings", [])
+    if errs:
+        return CheckResult("browser_console_errors", "browser", FAIL,
+                           f"{len(errs)} console error(s), {len(warns)} warning(s): {errs[0]['text'][:100]}")
+    if len(warns) > 5:
+        return CheckResult("browser_console_errors", "browser", WARN,
+                           f"{len(warns)} console warnings: {warns[0]['text'][:100]}")
+    return CheckResult("browser_console_errors", "browser", PASS,
+                       f"0 errors, {len(warns)} warnings")
+
+
+def check_browser_failed_requests(s: Site) -> CheckResult:
+    br = _br(s)
+    if br is None:
+        return CheckResult("browser_failed_requests", "browser", INFO, "browser mode off")
+    if br.get("error"):
+        return CheckResult("browser_failed_requests", "browser", INFO, "browser failed")
+    fails = br.get("failed_requests", [])
+    if not fails:
+        return CheckResult("browser_failed_requests", "browser", PASS, "all network requests succeeded")
+    return CheckResult("browser_failed_requests", "browser", FAIL,
+                       f"{len(fails)} failed request(s): {fails[0]['url'][:80]} ({fails[0]['failure']})")
+
+
+def check_browser_load_time(s: Site) -> CheckResult:
+    br = _br(s)
+    if br is None:
+        return CheckResult("browser_load_time", "browser", INFO, "browser mode off")
+    if br.get("error"):
+        return CheckResult("browser_load_time", "browser", INFO, "browser failed")
+    t = br.get("load_complete_ms", 0)
+    dcl = br.get("dom_content_loaded_ms", 0)
+    if t == 0:
+        return CheckResult("browser_load_time", "browser", INFO, "no timing data")
+    if t > 5000:
+        return CheckResult("browser_load_time", "browser", FAIL,
+                           f"load={t}ms, DCL={dcl}ms — very slow")
+    if t > 3000:
+        return CheckResult("browser_load_time", "browser", WARN,
+                           f"load={t}ms, DCL={dcl}ms")
+    return CheckResult("browser_load_time", "browser", PASS,
+                       f"load={t}ms, DCL={dcl}ms")
+
+
+def check_browser_lcp(s: Site) -> CheckResult:
+    """Largest Contentful Paint (Core Web Vital: good <2500ms, poor >4000ms)."""
+    br = _br(s)
+    if br is None:
+        return CheckResult("browser_lcp", "browser", INFO, "browser mode off")
+    if br.get("error"):
+        return CheckResult("browser_lcp", "browser", INFO, "browser failed")
+    lcp = br.get("lcp_ms", 0)
+    if lcp == 0:
+        return CheckResult("browser_lcp", "browser", INFO, "LCP not observed")
+    if lcp > 4000:
+        return CheckResult("browser_lcp", "browser", FAIL, f"{lcp}ms (>4000 = poor)")
+    if lcp > 2500:
+        return CheckResult("browser_lcp", "browser", WARN, f"{lcp}ms (2500–4000 = needs improvement)")
+    return CheckResult("browser_lcp", "browser", PASS, f"{lcp}ms (<2500 = good)")
+
+
+def check_browser_cls(s: Site) -> CheckResult:
+    """Cumulative Layout Shift (Core Web Vital: good <0.1, poor >0.25)."""
+    br = _br(s)
+    if br is None:
+        return CheckResult("browser_cls", "browser", INFO, "browser mode off")
+    if br.get("error"):
+        return CheckResult("browser_cls", "browser", INFO, "browser failed")
+    cls = br.get("cls", 0.0)
+    if cls > 0.25:
+        return CheckResult("browser_cls", "browser", FAIL, f"{cls:.3f} (>0.25 = poor)")
+    if cls > 0.1:
+        return CheckResult("browser_cls", "browser", WARN, f"{cls:.3f} (0.1–0.25 = needs improvement)")
+    return CheckResult("browser_cls", "browser", PASS, f"{cls:.3f} (<0.1 = good)")
+
+
+def check_browser_fcp(s: Site) -> CheckResult:
+    """First Contentful Paint: good <1800ms, poor >3000ms."""
+    br = _br(s)
+    if br is None:
+        return CheckResult("browser_fcp", "browser", INFO, "browser mode off")
+    if br.get("error"):
+        return CheckResult("browser_fcp", "browser", INFO, "browser failed")
+    fcp = br.get("fcp_ms", 0)
+    if fcp == 0:
+        return CheckResult("browser_fcp", "browser", INFO, "FCP not observed")
+    if fcp > 3000:
+        return CheckResult("browser_fcp", "browser", FAIL, f"{fcp}ms (>3000 = poor)")
+    if fcp > 1800:
+        return CheckResult("browser_fcp", "browser", WARN, f"{fcp}ms (1800–3000 = needs improvement)")
+    return CheckResult("browser_fcp", "browser", PASS, f"{fcp}ms (<1800 = good)")
 
 
 # ---------- Mobile / desktop checks (PageSpeed-style) ----------
@@ -2519,10 +2738,14 @@ CHECKS: list[CheckFn] = [
     check_render_blocking, check_lcp_hints,
     check_http2_http3, check_compression,
     check_mobile_content_parity, check_responsive_images_srcset,
+    # browser (opt-in via --browser; returns INFO when off)
+    check_browser_js_errors, check_browser_console_errors,
+    check_browser_failed_requests, check_browser_load_time,
+    check_browser_fcp, check_browser_lcp, check_browser_cls,
 ]
 
 
-def build_site(url: str) -> Site:
+def build_site(url: str, browser: bool = False) -> Site:
     session = requests.Session()
     r = fetch(session, url)
     soup = BeautifulSoup(r.text, "html.parser")
@@ -2541,10 +2764,14 @@ def build_site(url: str) -> Site:
     parsed = urlparse(r.url)
     if parsed.scheme == "https" and parsed.hostname:
         tls_info = _tls_probe(parsed.hostname, parsed.port or 443)
+    # optional headless-browser audit (one navigation, reused by every browser check)
+    browser_result: Optional[dict] = None
+    if browser:
+        browser_result = run_browser_audit(r.url)
     return Site(url=url, final_url=r.url, response=r, soup=soup,
                 robots_text=robots, robots_content_type=robots_ct,
                 robots_status=robots_status, robots_url=robots_url, session=session,
-                tls_info=tls_info)
+                tls_info=tls_info, browser_result=browser_result)
 
 
 class ProgressBar:
@@ -2575,12 +2802,14 @@ class ProgressBar:
             sys.stderr.flush()
 
 
-def run_all(url: str, progress: bool = True) -> list[CheckResult]:
-    site = build_site(url)
-    # total = simple checks + sitemap + sitemap_urls + 2 link probes
-    bar = ProgressBar(total=len(CHECKS) + 4, enabled=progress)
+def run_all(url: str, progress: bool = True, browser: bool = False) -> list[CheckResult]:
+    site = build_site(url, browser=browser)
+    # skip browser-only checks entirely when --browser is off (otherwise 7 INFO noise rows)
+    active_checks = [fn for fn in CHECKS
+                     if browser or not fn.__name__.startswith("check_browser_")]
+    bar = ProgressBar(total=len(active_checks) + 4, enabled=progress)
     results: list[CheckResult] = []
-    for fn in CHECKS:
+    for fn in active_checks:
         r = fn(site)
         results.append(r)
         bar.tick(r)
@@ -2596,7 +2825,7 @@ def run_all(url: str, progress: bool = True) -> list[CheckResult]:
         bar.tick(r)
     bar.close()
     order = {"shared": 0, "security": 1, "seo": 2, "llm": 3, "perf": 4,
-             "a11y": 5, "privacy": 6, "email": 7}
+             "browser": 5, "a11y": 6, "privacy": 7, "email": 8}
     results.sort(key=lambda r: (order.get(r.category, 9), r.check))
     return results
 
@@ -2606,8 +2835,9 @@ def render_markdown(url: str, results: Iterable[CheckResult]) -> str:
     lines = [f"# SEO + LLM check: {url}\n"]
     categories = [("shared", "Shared / Transport"), ("security", "Security / TLS / DNS"),
                   ("seo", "SEO"), ("llm", "LLM-readiness"),
-                  ("perf", "Performance"), ("a11y", "Accessibility"),
-                  ("privacy", "Privacy"), ("email", "Email / DNS")]
+                  ("perf", "Performance"), ("browser", "Runtime (headless browser)"),
+                  ("a11y", "Accessibility"), ("privacy", "Privacy"),
+                  ("email", "Email / DNS")]
     for cat, label in categories:
         rows = [r for r in results if r.category == cat]
         if not rows:
@@ -2636,6 +2866,11 @@ def main(argv: list[str]) -> int:
                     help="exit non-zero if any check at or above this severity")
     ap.add_argument("--no-progress", action="store_true",
                     help="suppress the stderr progress bar")
+    ap.add_argument("--browser", action="store_true",
+                    help="run a headless Chromium audit (JS errors, LCP, CLS, FCP, "
+                         "load time, console errors, failed requests). "
+                         "Needs: pip install -r requirements-browser.txt "
+                         "&& playwright install chromium")
     args = ap.parse_args(argv)
 
     url = args.url
@@ -2643,7 +2878,7 @@ def main(argv: list[str]) -> int:
         url = "https://" + url
 
     try:
-        results = run_all(url, progress=not args.no_progress)
+        results = run_all(url, progress=not args.no_progress, browser=args.browser)
     except requests.RequestException as e:
         print(f"fatal: could not fetch {url}: {e}", file=sys.stderr)
         return 2

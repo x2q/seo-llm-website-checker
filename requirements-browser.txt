@@ -1,0 +1,5 @@
+# Optional deps for --browser mode (runs a real headless Chromium)
+# Install with:
+#   pip install -r requirements.txt -r requirements-browser.txt
+#   playwright install chromium
+playwright>=1.40

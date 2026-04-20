@@ -1,6 +1,6 @@
 # seo-llm-website-checker
 
-A single-file Python CLI that audits one live URL against **86 checks** across SEO, performance, security, accessibility, privacy, email DNS, and LLM-readiness — in one command, in ~5 seconds.
+A single-file Python CLI that audits one live URL against **86 static checks** (plus 7 optional runtime checks via headless Chromium) across SEO, performance, security, accessibility, privacy, email DNS, and LLM-readiness — in one command, in ~5 seconds (plus ~3 s if `--browser`).
 
 Covers the ground an Ahrefs / Screaming Frog / Sitebulb / Lighthouse / Google Search Console / PageSpeed audit would, for a single page. No headless browser, no multi-page crawl, no paid APIs — just `requests`, `BeautifulSoup`, `dnspython`, and stdlib `ssl` / `socket`.
 
@@ -12,6 +12,13 @@ pip install -r requirements.txt
 
 Three deps: `requests`, `beautifulsoup4`, `dnspython`.
 
+**Optional — headless-browser mode** (adds 7 runtime checks: JS errors, console errors, failed requests, load time, FCP, LCP, CLS):
+
+```sh
+pip install -r requirements-browser.txt
+playwright install chromium
+```
+
 ## Run
 
 ```sh
@@ -20,6 +27,7 @@ python check.py https://example.com --json           # JSON for CI
 python check.py https://example.com --fail-on fail   # exit 1 on any 🔴
 python check.py https://example.com --fail-on warn   # exit 1 on any 🟡 or 🔴
 python check.py https://example.com --no-progress    # silence stderr bar
+python check.py https://example.com --browser        # add headless-Chromium runtime checks
 ```
 
 While running, a live progress bar renders on stderr:
@@ -146,6 +154,20 @@ Crawlability:
 | `compression` | probes `br` / `zstd` / `gzip` / `deflate` with `Accept-Encoding`, measures wire bytes, reports savings |
 | `mobile_content_parity` | refetches with iPhone Safari UA; flags blocks, m./mobile redirects, HTML-size divergence |
 
+### Runtime — headless browser (7, opt-in via `--browser`)
+
+One navigation in Chromium (Playwright) reused by all seven checks:
+
+| Check | Rule |
+|---|---|
+| `browser_js_errors` | no uncaught JS exceptions (`pageerror` events) |
+| `browser_console_errors` | FAIL on any `console.error`; WARN if >5 warnings |
+| `browser_failed_requests` | FAIL on any `requestfailed` event (network errors, CORS blocks) |
+| `browser_load_time` | WARN `load` event >3 s, FAIL >5 s |
+| `browser_fcp` | First Contentful Paint: good <1800 ms, poor >3000 ms |
+| `browser_lcp` | Largest Contentful Paint (Core Web Vital): good <2500 ms, poor >4000 ms |
+| `browser_cls` | Cumulative Layout Shift (Core Web Vital): good <0.1, poor >0.25 |
+
 ### Accessibility (4)
 
 - `heading_hierarchy` — exactly one `<h1>`, no skipped levels
@@ -167,12 +189,12 @@ Crawlability:
 
 ## Limitations
 
-No headless browser means this tool can't measure:
+Even with `--browser`, this tool still can't measure:
 
-- Core Web Vitals (LCP/CLS/INP from field data — only static hints)
-- JavaScript errors or runtime behaviour
-- Colour contrast, tap-target size, actual layout shift
-- Multi-page signals: duplicate content across pages, orphan pages, internal PageRank
+- **Core Web Vitals from field data** (the `--browser` LCP/CLS are synthetic — from this one load, not real users). For field data, use CrUX or PageSpeed Insights API.
+- **Multi-page signals**: duplicate content across pages, orphan pages, internal PageRank
+- **Colour contrast, tap-target size** (needs rendering geometry + DOM traversal)
+- **INP** — needs user interaction; only available from field data
 
 For those, reach for Lighthouse or a real crawler. This tool gives you the other ~80% in one command.
 
