@@ -17,7 +17,8 @@ import socket
 import ssl
 import sys
 import warnings
-from concurrent.futures import ThreadPoolExecutor
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, Optional
@@ -235,13 +236,19 @@ def check_dual_stack_assets(s: Site) -> CheckResult:
 # host-level caches so multi-URL runs don't repeat expensive probes
 _TLS_CACHE: dict[str, dict] = {}
 _ROBOTS_CACHE: dict[str, tuple[Optional[str], Optional[str], Optional[int], str]] = {}
+_CACHE_LOCK = threading.Lock()
 
 
 def _tls_probe_cached(host: str, port: int = 443) -> dict:
     key = f"{host}:{port}"
-    if key not in _TLS_CACHE:
-        _TLS_CACHE[key] = _tls_probe(host, port)
-    return _TLS_CACHE[key]
+    with _CACHE_LOCK:
+        if key in _TLS_CACHE:
+            return _TLS_CACHE[key]
+    # probe outside the lock (slow; we don't want to block other hosts)
+    result = _tls_probe(host, port)
+    with _CACHE_LOCK:
+        _TLS_CACHE.setdefault(key, result)
+        return _TLS_CACHE[key]
 
 
 def _tls_probe(host: str, port: int = 443, timeout: float = 6.0) -> dict:
@@ -731,6 +738,7 @@ class BrowserPool:
         self.browser = None
         self.context = None
         self.error: Optional[str] = None
+        self._lock = threading.Lock()
 
     def start(self) -> Optional[str]:
         try:
@@ -754,6 +762,11 @@ class BrowserPool:
         return None
 
     def audit(self, url: str, timeout_ms: int = 30000) -> dict:
+        # Playwright sync API is not thread-safe — serialise navigations on the shared context.
+        with self._lock:
+            return self._audit_locked(url, timeout_ms)
+
+    def _audit_locked(self, url: str, timeout_ms: int) -> dict:
         if self.error or not self.context:
             return {"error": self.error or "browser pool not started"}
         console_errors: list[dict] = []
@@ -2802,9 +2815,11 @@ def build_site(url: str, session: Optional[requests.Session] = None,
     r = fetch(session, url)
     soup = BeautifulSoup(r.text, "html.parser")
     host = urlparse(r.url).hostname or ""
-    # host-cached robots.txt
-    if host in _ROBOTS_CACHE:
-        robots, robots_ct, robots_status, robots_url = _ROBOTS_CACHE[host]
+    # host-cached robots.txt (thread-safe: check-set around the slow fetch)
+    with _CACHE_LOCK:
+        cached = _ROBOTS_CACHE.get(host)
+    if cached is not None:
+        robots, robots_ct, robots_status, robots_url = cached
     else:
         robots_url = urljoin(root_url(r.url), "/robots.txt")
         robots, robots_ct, robots_status = None, None, None
@@ -2816,7 +2831,9 @@ def build_site(url: str, session: Optional[requests.Session] = None,
                 robots = rr.text
         except requests.RequestException:
             pass
-        _ROBOTS_CACHE[host] = (robots, robots_ct, robots_status, robots_url)
+        with _CACHE_LOCK:
+            _ROBOTS_CACHE.setdefault(host, (robots, robots_ct, robots_status, robots_url))
+            robots, robots_ct, robots_status, robots_url = _ROBOTS_CACHE[host]
     # host-cached TLS probe
     tls_info: Optional[dict] = None
     parsed = urlparse(r.url)
@@ -2886,19 +2903,21 @@ class ProgressBar:
         self.width = width
         self.done = 0
         self.enabled = enabled and sys.stderr.isatty()
+        self._lock = threading.Lock()
 
     def tick(self, result: CheckResult) -> None:
         if not self.enabled:
             return
-        self.done += 1
-        filled = int(self.width * self.done / self.total)
-        bar = "█" * filled + "░" * (self.width - filled)
-        pct = int(100 * self.done / self.total)
-        icon = ICON.get(result.status, " ")
-        label = f"{icon} {result.check}"[:40]
-        line = f"\r[{bar}] {self.done:>2}/{self.total} {pct:>3}%  {label}"
-        sys.stderr.write(line.ljust(80))
-        sys.stderr.flush()
+        with self._lock:
+            self.done += 1
+            filled = int(self.width * self.done / self.total)
+            bar = "█" * filled + "░" * (self.width - filled)
+            pct = int(100 * self.done / self.total)
+            icon = ICON.get(result.status, " ")
+            label = f"{icon} {result.check}"[:40]
+            line = f"\r[{bar}] {self.done:>2}/{self.total} {pct:>3}%  {label}"
+            sys.stderr.write(line.ljust(80))
+            sys.stderr.flush()
 
     def close(self) -> None:
         if self.enabled:
@@ -2953,13 +2972,22 @@ def run_site_audit(url: str, progress: bool = True, browser: bool = True,
     total_ticks = len(site_wide_fns) + len(active_per_url) * len(urls) + 2 * len(urls)
     bar = ProgressBar(total=total_ticks, enabled=progress)
 
+    def _run_checks_sequential(site: Site, fns: list[CheckFn]) -> list[CheckResult]:
+        """Run check functions one at a time (some checks fan out their own parallel
+        HEAD/DNS internally — a single shared session keeps connection reuse good)."""
+        out: list[CheckResult] = []
+        for fn in fns:
+            try:
+                r = fn(site)
+            except Exception as e:
+                r = CheckResult(_check_name(fn), "shared", FAIL,
+                                f"check crashed: {type(e).__name__}: {e}")
+            out.append(r)
+            bar.tick(r)
+        return out
+
     # ── site-wide checks on homepage ──
-    site_wide_results: list[CheckResult] = []
-    for fn in site_wide_fns:
-        r = fn(homepage)
-        site_wide_results.append(r)
-        bar.tick(r)
-    # sitemap is site-wide (same for every page on the host)
+    site_wide_results = _run_checks_sequential(homepage, site_wide_fns)
     sm_result, locs = check_sitemap(homepage)
     site_wide_results.append(sm_result)
     bar.tick(sm_result)
@@ -2967,31 +2995,39 @@ def run_site_audit(url: str, progress: bool = True, browser: bool = True,
     site_wide_results.append(su)
     bar.tick(su)
 
-    # ── per-URL checks ──
+    # ── per-URL checks — PARALLEL across URLs ──
+    # The big win is running many URLs concurrently; each URL's own checks stay
+    # sequential so we don't fight nested thread pools inside dkim/dual_stack/etc.
     per_url_results: dict[str, list[CheckResult]] = {}
-    for i, u in enumerate(urls):
-        # reuse homepage site for the first URL if it matches (save a fetch)
+
+    def _audit_one_url(i: int, u: str) -> tuple[str, list[CheckResult]]:
         if u == homepage.final_url and i == 0:
             site = homepage
             if pool is not None:
                 site.browser_result = pool.audit(u)
         else:
             try:
-                site = build_site(u, session=session, browser_pool=pool)
+                # each thread needs its own Session to avoid urllib3 contention
+                site = build_site(u, session=requests.Session(), browser_pool=pool)
             except requests.RequestException as e:
-                per_url_results[u] = [CheckResult("fetch_failed", "shared", FAIL, str(e))]
-                continue
-
-        res: list[CheckResult] = []
-        for fn in active_per_url:
-            r = fn(site)
-            res.append(r)
-            bar.tick(r)
-        # internal-link probe is per-URL (each page has different links)
+                return u, [CheckResult("fetch_failed", "shared", FAIL, str(e))]
+        res = _run_checks_sequential(site, active_per_url)
         link_results, _ = _probe_internal_links(site)
-        for lr in link_results:
-            res.append(lr)
-        per_url_results[u] = _sort_results(res)
+        res.extend(link_results)
+        return u, _sort_results(res)
+
+    # concurrency cap — 4 URLs at a time keeps nested fanout manageable on macOS
+    max_url_workers = min(4, max(1, len(urls)))
+    if max_url_workers == 1 or len(urls) == 1:
+        for i, u in enumerate(urls):
+            key, res = _audit_one_url(i, u)
+            per_url_results[key] = res
+    else:
+        with ThreadPoolExecutor(max_workers=max_url_workers) as ex:
+            futures = [ex.submit(_audit_one_url, i, u) for i, u in enumerate(urls)]
+            for fut in as_completed(futures):
+                key, res = fut.result()
+                per_url_results[key] = res
 
     bar.close()
     if pool is not None:
