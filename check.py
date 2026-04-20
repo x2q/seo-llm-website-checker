@@ -1358,14 +1358,54 @@ def build_site(url: str) -> Site:
                 robots_text=robots, robots_content_type=robots_ct, session=session)
 
 
-def run_all(url: str) -> list[CheckResult]:
+class ProgressBar:
+    """Tiny stderr progress bar. Disables itself when stderr isn't a TTY."""
+
+    def __init__(self, total: int, enabled: bool = True, width: int = 28):
+        self.total = total
+        self.width = width
+        self.done = 0
+        self.enabled = enabled and sys.stderr.isatty()
+
+    def tick(self, result: CheckResult) -> None:
+        if not self.enabled:
+            return
+        self.done += 1
+        filled = int(self.width * self.done / self.total)
+        bar = "█" * filled + "░" * (self.width - filled)
+        pct = int(100 * self.done / self.total)
+        icon = ICON.get(result.status, " ")
+        label = f"{icon} {result.check}"[:40]
+        line = f"\r[{bar}] {self.done:>2}/{self.total} {pct:>3}%  {label}"
+        sys.stderr.write(line.ljust(80))
+        sys.stderr.flush()
+
+    def close(self) -> None:
+        if self.enabled:
+            sys.stderr.write("\r" + " " * 80 + "\r")
+            sys.stderr.flush()
+
+
+def run_all(url: str, progress: bool = True) -> list[CheckResult]:
     site = build_site(url)
-    results = [fn(site) for fn in CHECKS]
+    # total = simple checks + sitemap + sitemap_urls + 2 link probes
+    bar = ProgressBar(total=len(CHECKS) + 4, enabled=progress)
+    results: list[CheckResult] = []
+    for fn in CHECKS:
+        r = fn(site)
+        results.append(r)
+        bar.tick(r)
     sm_result, locs = check_sitemap(site)
     results.append(sm_result)
-    results.append(check_sitemap_urls_reachable(site, locs))
+    bar.tick(sm_result)
+    su = check_sitemap_urls_reachable(site, locs)
+    results.append(su)
+    bar.tick(su)
     link_results, _ = _probe_internal_links(site)
-    results.extend(link_results)
+    for r in link_results:
+        results.append(r)
+        bar.tick(r)
+    bar.close()
     order = {"shared": 0, "seo": 1, "llm": 2, "perf": 3}
     results.sort(key=lambda r: (order.get(r.category, 9), r.check))
     return results
@@ -1402,6 +1442,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--json", action="store_true", help="emit JSON instead of markdown")
     ap.add_argument("--fail-on", choices=["warn", "fail"], default=None,
                     help="exit non-zero if any check at or above this severity")
+    ap.add_argument("--no-progress", action="store_true",
+                    help="suppress the stderr progress bar")
     args = ap.parse_args(argv)
 
     url = args.url
@@ -1409,7 +1451,7 @@ def main(argv: list[str]) -> int:
         url = "https://" + url
 
     try:
-        results = run_all(url)
+        results = run_all(url, progress=not args.no_progress)
     except requests.RequestException as e:
         print(f"fatal: could not fetch {url}: {e}", file=sys.stderr)
         return 2
