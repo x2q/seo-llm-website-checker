@@ -872,64 +872,6 @@ def check_button_accessible_name(s: Site) -> CheckResult:
 
 # ---------- Privacy ----------
 
-KNOWN_TRACKERS = {
-    "google-analytics.com": "Google Analytics",
-    "googletagmanager.com": "Google Tag Manager",
-    "doubleclick.net": "Google Ads / DoubleClick",
-    "facebook.net": "Facebook Pixel",
-    "connect.facebook.net": "Facebook Pixel",
-    "hotjar.com": "Hotjar",
-    "static.hotjar.com": "Hotjar",
-    "clarity.ms": "Microsoft Clarity",
-    "mixpanel.com": "Mixpanel",
-    "segment.com": "Segment",
-    "analytics.tiktok.com": "TikTok Pixel",
-    "snap.licdn.com": "LinkedIn Insight",
-    "ads.linkedin.com": "LinkedIn Ads",
-    "pinimg.com": "Pinterest Tag",
-    "amplitude.com": "Amplitude",
-    "fullstory.com": "FullStory",
-}
-
-
-def check_third_party_trackers(s: Site) -> CheckResult:
-    """Third-party hosts + known trackers on the page. Flag trackers that load
-    before any cookie-consent UI (heuristic)."""
-    host = urlparse(s.final_url).hostname or ""
-    third_party_hosts: set[str] = set()
-    for tag, attr in [("script", "src"), ("img", "src"), ("iframe", "src"), ("link", "href")]:
-        for el in s.soup.find_all(tag, attrs={attr: True}):
-            url = urljoin(s.final_url, el[attr])
-            h = urlparse(url).hostname
-            if h and h != host:
-                third_party_hosts.add(h)
-    # match known trackers
-    trackers_found: list[str] = []
-    for h in third_party_hosts:
-        for domain, name in KNOWN_TRACKERS.items():
-            if h == domain or h.endswith("." + domain):
-                trackers_found.append(name)
-                break
-    trackers_found = sorted(set(trackers_found))
-    # heuristic: does the page mention a cookie banner?
-    page_text = s.soup.get_text(" ", strip=True).lower()
-    has_banner = any(s in page_text for s in
-                     ("cookie", "consent", "accepter", "samtykke", "privatliv"))
-    if trackers_found and not has_banner:
-        return CheckResult("third_party_trackers", "privacy", FAIL,
-                           f"{len(trackers_found)} tracker(s) + no cookie banner detected: "
-                           f"{', '.join(trackers_found)} (GDPR/ePrivacy requires consent)")
-    if len(third_party_hosts) > 10:
-        return CheckResult("third_party_trackers", "privacy", WARN,
-                           f"{len(third_party_hosts)} third-party hosts; "
-                           f"trackers: {', '.join(trackers_found) or 'none known'}")
-    if trackers_found:
-        return CheckResult("third_party_trackers", "privacy", WARN,
-                           f"{len(trackers_found)} tracker(s) present (consent banner detected): "
-                           f"{', '.join(trackers_found)}")
-    return CheckResult("third_party_trackers", "privacy", PASS,
-                       f"{len(third_party_hosts)} third-party host(s), no known trackers")
-
 
 def check_cookie_flags(s: Site) -> CheckResult:
     """Set-Cookie flags on the HTTPS response: Secure + HttpOnly + SameSite."""
@@ -2557,7 +2499,7 @@ CHECKS: list[CheckFn] = [
     check_heading_hierarchy, check_form_inputs_labeled,
     check_landmark_regions, check_button_accessible_name,
     # privacy
-    check_third_party_trackers, check_cookie_flags,
+    check_cookie_flags,
     # email
     check_mx_records, check_spf_record, check_dmarc_record,
     check_dkim_record, check_mta_sts,

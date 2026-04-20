@@ -119,7 +119,6 @@ A live stderr progress bar renders while checks run (`[████░░░░]
 
 ### Privacy
 
-- **`third_party_trackers`** — counts third-party hosts and flags known trackers (GA, GTM, Facebook, Hotjar, Clarity, Mixpanel, Segment, TikTok, LinkedIn, Pinterest, Amplitude, FullStory). FAIL if trackers present and no cookie banner detected
 - **`cookie_flags`** — every `Set-Cookie` on HTTPS has `Secure` + `HttpOnly` + `SameSite`
 
 ### Email / DNS
