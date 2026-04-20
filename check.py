@@ -630,20 +630,139 @@ def check_http2_http3(s: Site) -> CheckResult:
 
 
 def check_compression(s: Site) -> CheckResult:
-    """HTML served with gzip / br / zstd when encoded."""
-    enc = s.response.headers.get("Content-Encoding", "").lower()
+    """Probe each compression algorithm the server supports."""
     size = len(s.response.content)
-    if size < 10 * 1024:
+    algorithms = ("br", "zstd", "gzip", "deflate")
+    supported: dict[str, int] = {}
+    def wire_bytes(url: str, accept_encoding: str) -> tuple[Optional[int], str]:
+        """Return (bytes-on-the-wire, negotiated Content-Encoding) or (None, '') on failure."""
+        try:
+            r = s.session.get(url, headers={"Accept-Encoding": accept_encoding,
+                                            "User-Agent": UA},
+                              timeout=TIMEOUT, allow_redirects=True, stream=True)
+        except requests.RequestException:
+            return None, ""
+        try:
+            enc = r.headers.get("Content-Encoding", "").lower().split(",")[0].strip()
+            raw = b""
+            for chunk in r.raw.stream(decode_content=False):
+                raw += chunk
+                if len(raw) > 4 * 1024 * 1024:  # safety cap
+                    break
+            return len(raw), enc
+        finally:
+            r.close()
+
+    # baseline = identity (uncompressed) wire size
+    baseline, _ = wire_bytes(s.final_url, "identity")
+    for algo in algorithms:
+        wire, enc = wire_bytes(s.final_url, algo)
+        if wire is not None and enc == algo:
+            supported[algo] = wire
+    if size < 10 * 1024 and not supported:
         return CheckResult("compression", "perf", INFO,
                            f"HTML {size // 1024} KB — too small to matter")
-    if enc in ("br", "zstd"):
+    if not supported:
+        return CheckResult("compression", "perf", FAIL,
+                           f"HTML {size // 1024} KB served uncompressed (no br/zstd/gzip/deflate)")
+    # build message
+    parts = []
+    for algo in algorithms:
+        if algo in supported:
+            if baseline and baseline > 0:
+                saved = int(100 * (1 - supported[algo] / baseline))
+                parts.append(f"{algo}={supported[algo] // 1024}KB (-{saved}%)")
+            else:
+                parts.append(f"{algo}={supported[algo] // 1024}KB")
+    if "br" in supported or "zstd" in supported:
         return CheckResult("compression", "perf", PASS,
-                           f"Content-Encoding={enc} (modern)")
-    if enc == "gzip":
+                           f"modern compression: {', '.join(parts)}")
+    if "gzip" in supported:
         return CheckResult("compression", "perf", WARN,
-                           f"Content-Encoding=gzip — consider br/zstd (~15-20% smaller)")
-    return CheckResult("compression", "perf", FAIL,
-                       f"HTML {size // 1024} KB served uncompressed — enable gzip/brotli")
+                           f"only legacy compression: {', '.join(parts)} — enable brotli (~15–20% smaller)")
+    return CheckResult("compression", "perf", WARN,
+                       f"compression supported: {', '.join(parts)}")
+
+
+# ---------- Mobile / desktop checks (PageSpeed-style) ----------
+
+MOBILE_UA = ("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+             "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+             "Mobile/15E148 Safari/604.1")
+DESKTOP_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 14_0) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36")
+
+
+def _fetch_with_ua(session: requests.Session, url: str, ua: str
+                   ) -> Optional[requests.Response]:
+    try:
+        return session.get(url, headers={"User-Agent": ua, "Accept": "*/*"},
+                           timeout=TIMEOUT, allow_redirects=True)
+    except requests.RequestException:
+        return None
+
+
+def check_mobile_content_parity(s: Site) -> CheckResult:
+    """Mobile UA should get the same content as desktop (no cloaking / m. divergence)."""
+    mobile_r = _fetch_with_ua(s.session, s.final_url, MOBILE_UA)
+    if mobile_r is None:
+        return CheckResult("mobile_content_parity", "perf", FAIL,
+                           "mobile fetch failed — server may block mobile UA")
+    if mobile_r.status_code != 200:
+        return CheckResult("mobile_content_parity", "perf", FAIL,
+                           f"mobile UA got {mobile_r.status_code} (desktop got 200)")
+    # detect redirect to m. subdomain (legacy anti-pattern)
+    mobile_host = urlparse(mobile_r.url).hostname or ""
+    desktop_host = urlparse(s.final_url).hostname or ""
+    if mobile_host != desktop_host:
+        if mobile_host.startswith("m.") or "/mobile" in urlparse(mobile_r.url).path:
+            return CheckResult("mobile_content_parity", "perf", WARN,
+                               f"mobile UA redirected {desktop_host} → {mobile_r.url} "
+                               "(m./mobile subdomain is a legacy pattern — prefer responsive design)")
+    desktop_size = len(s.response.content)
+    mobile_size = len(mobile_r.content)
+    if desktop_size == 0:
+        return CheckResult("mobile_content_parity", "perf", INFO, "desktop response empty")
+    ratio = mobile_size / desktop_size
+    # mobile should be the same page or very close
+    if ratio < 0.3:
+        return CheckResult("mobile_content_parity", "perf", WARN,
+                           f"mobile HTML is {int(ratio*100)}% of desktop "
+                           f"({mobile_size // 1024} KB vs {desktop_size // 1024} KB) "
+                           "— content divergence may hide features from mobile users")
+    if ratio > 3:
+        return CheckResult("mobile_content_parity", "perf", WARN,
+                           f"mobile HTML is {int(ratio*100)}% of desktop — unusual divergence")
+    return CheckResult("mobile_content_parity", "perf", PASS,
+                       f"mobile HTML {mobile_size // 1024} KB (desktop {desktop_size // 1024} KB); "
+                       f"no divergence")
+
+
+def check_responsive_images_srcset(s: Site) -> CheckResult:
+    """Images use srcset or <picture><source> for different display densities."""
+    imgs = s.soup.find_all("img")
+    if len(imgs) < 3:
+        return CheckResult("responsive_images_srcset", "perf", INFO,
+                           f"only {len(imgs)} images")
+    responsive = 0
+    for img in imgs:
+        if img.get("srcset"):
+            responsive += 1
+            continue
+        if img.find_parent("picture"):
+            responsive += 1
+            continue
+    pct = responsive * 100 // len(imgs)
+    if pct >= 70:
+        return CheckResult("responsive_images_srcset", "perf", PASS,
+                           f"{responsive}/{len(imgs)} images responsive ({pct}%)")
+    if pct >= 30:
+        return CheckResult("responsive_images_srcset", "perf", WARN,
+                           f"only {responsive}/{len(imgs)} use srcset or <picture> ({pct}%) — "
+                           "mobile users download desktop-size images")
+    return CheckResult("responsive_images_srcset", "perf", FAIL,
+                       f"{responsive}/{len(imgs)} responsive ({pct}%) — "
+                       "add srcset for DPR / viewport sizes")
 
 
 # ---------- Accessibility (a11y) ----------
@@ -2449,6 +2568,7 @@ CHECKS: list[CheckFn] = [
     check_inline_asset_size, check_dom_size,
     check_render_blocking, check_lcp_hints,
     check_http2_http3, check_compression,
+    check_mobile_content_parity, check_responsive_images_srcset,
 ]
 
 
