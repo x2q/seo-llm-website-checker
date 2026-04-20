@@ -257,16 +257,93 @@ def _head_or_get(session: requests.Session, url: str) -> requests.Response:
     return r
 
 
+def _inspect_image(body: bytes, ct: str) -> tuple[Optional[str], Optional[int], Optional[int]]:
+    """Return (format, width, height). width/height may be None for SVG or unparsed formats."""
+    if body.startswith(b"\x89PNG\r\n\x1a\n") and len(body) >= 24:
+        return "PNG", int.from_bytes(body[16:20], "big"), int.from_bytes(body[20:24], "big")
+    if body[:4] == b"\x00\x00\x01\x00" and len(body) >= 22:  # ICO
+        count = int.from_bytes(body[4:6], "little")
+        best = (0, 0)
+        for i in range(count):
+            off = 6 + i * 16
+            if off + 2 > len(body):
+                break
+            w = body[off] or 256
+            h = body[off + 1] or 256
+            if w * h > best[0] * best[1]:
+                best = (w, h)
+        return "ICO", best[0] or None, best[1] or None
+    if body[:6] in (b"GIF87a", b"GIF89a") and len(body) >= 10:
+        return "GIF", int.from_bytes(body[6:8], "little"), int.from_bytes(body[8:10], "little")
+    if ct.startswith("image/svg") or b"<svg" in body[:400].lower():
+        return "SVG", None, None
+    if body[:2] == b"\xff\xd8":
+        return "JPEG", None, None
+    if body[:4] == b"RIFF" and body[8:12] == b"WEBP":
+        return "WEBP", None, None
+    return None, None, None
+
+
 def check_favicon(s: Site) -> CheckResult:
-    link = s.soup.find("link", rel=lambda v: v and ("icon" in v and "apple" not in v))
-    href = link.get("href") if link else "/favicon.ico"
+    """Favicon meets Google Search's favicon requirements."""
+    link = s.soup.find("link", rel=lambda v: v and "icon" in v and "apple" not in v)
+    declared = link.get("href") if link and link.get("href") else None
+    href = declared or "/favicon.ico"
     url = urljoin(s.final_url, href)
+
+    # 1. Crawlable by Googlebot (per robots.txt)
+    if s.robots_text:
+        path = urlparse(url).path or "/"
+        groups = _parse_robots_groups(s.robots_text)
+        allowed, matched = _path_allowed_for("Googlebot", path, groups)
+        if not allowed:
+            return CheckResult("favicon", "seo", FAIL,
+                               f"robots.txt blocks Googlebot from favicon "
+                               f"({matched[0]}: {matched[1]}): {url}")
+
+    # 2. Fetches 200
     try:
-        r = _head_or_get(s.session, url)
+        r = s.session.get(url, timeout=TIMEOUT, allow_redirects=True,
+                          headers={"User-Agent": UA})
     except requests.RequestException as e:
-        return CheckResult("favicon", "seo", WARN, f"{url}: {e}")
-    ok = r.status_code == 200
-    return CheckResult("favicon", "seo", PASS if ok else WARN, f"{r.status_code} {url}")
+        return CheckResult("favicon", "seo", FAIL, f"{url}: {e}")
+    if r.status_code != 200:
+        return CheckResult("favicon", "seo", FAIL, f"{r.status_code} {url}")
+
+    # 3. Content-Type must be image/* (or ico variant)
+    ct = r.headers.get("Content-Type", "").lower().split(";")[0].strip()
+    if not (ct.startswith("image/") or "icon" in ct):
+        return CheckResult("favicon", "seo", WARN,
+                           f"Content-Type={ct!r} (expected image/*): {url}")
+
+    # 4. Format + dimensions
+    fmt, w, h = _inspect_image(r.content, ct)
+    if fmt is None:
+        return CheckResult("favicon", "seo", WARN,
+                           f"unknown format ({ct}, {len(r.content)} bytes): {url}")
+
+    declared_note = "" if link else "  (no <link rel=icon>; Google fell back to /favicon.ico)"
+
+    if fmt == "SVG":
+        status = PASS if link else WARN
+        return CheckResult("favicon", "seo", status,
+                           f"SVG (vector, scales){declared_note}: {url}")
+
+    # raster formats
+    if w is None or h is None:
+        return CheckResult("favicon", "seo", WARN,
+                           f"{fmt} — could not read dimensions: {url}")
+    if w != h:
+        return CheckResult("favicon", "seo", WARN,
+                           f"{fmt} {w}×{h} not square — Google needs square{declared_note}: {url}")
+    if w < 48:
+        return CheckResult("favicon", "seo", WARN,
+                           f"{fmt} {w}×{h} too small — Google wants multiple of 48 (48,96,144,192){declared_note}")
+    if w % 48 != 0:
+        return CheckResult("favicon", "seo", WARN,
+                           f"{fmt} {w}×{h} — Google prefers multiple of 48 (next: {((w // 48) + 1) * 48}){declared_note}")
+    return CheckResult("favicon", "seo", PASS,
+                       f"{fmt} {w}×{h}{declared_note}: {url}")
 
 
 def check_apple_touch_icon(s: Site) -> CheckResult:
