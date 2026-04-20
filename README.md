@@ -1,6 +1,6 @@
 # seo-llm-website-checker
 
-Single-file Python CLI that runs ~85 checks on a live website and reports issues as a markdown table (or JSON). Covers the same ground as a single-page Ahrefs / Screaming Frog / Sitebulb / Lighthouse / Google Search Console audit — plus Google Search Console "why pages aren't indexed" reasons, IPv4/IPv6 dual-stack, TLS cert + protocol, DNSSEC/CAA, CSP/COOP/COEP/SRI headers, accessibility basics (heading order, form labels, landmarks), privacy (trackers, cookie flags), email DNS hygiene (MX/SPF/DKIM/DMARC), and LLM-specific signals (`llms.txt`, AI crawler access, citable facts). No headless browser — just HTTP, HTML parsing, DNS, and `ssl`.
+Single-file Python CLI that runs ~90 checks on a live website and reports issues as a markdown table (or JSON). Covers the same ground as a single-page Ahrefs / Screaming Frog / Sitebulb / Lighthouse / Google Search Console / PageSpeed audit — plus Google Search Console "why pages aren't indexed" reasons, IPv4/IPv6 dual-stack, TLS cert + protocol, DNSSEC/CAA, CSP/COOP/COEP/SRI headers, accessibility basics (heading order, form labels, landmarks), privacy (trackers, cookie flags), email DNS hygiene (MX/SPF/DKIM/DMARC), desktop/mobile content parity, compression-algorithm probing (br/zstd/gzip/deflate), and LLM-specific signals (`llms.txt`, AI crawler access, citable facts). No headless browser — just HTTP, HTML parsing, DNS, and `ssl`.
 
 ## Install
 
@@ -93,7 +93,9 @@ A live stderr progress bar renders while checks run (`[████░░░░]
 - No dev CDNs (e.g. `cdn.tailwindcss.com`) in `<head>`
 - First `<img>` has `fetchpriority=high`/`loading=eager`, or a `<link rel=preload as=image>` is set (LCP)
 - **`http2_http3`** — ALPN negotiates `h2`; `Alt-Svc` header advertises `h3`. FAIL on `http/1.1` only
-- **`compression`** — HTML served with `br`/`zstd` (modern) or `gzip`. FAIL if ≥10 KB HTML is uncompressed
+- **`compression`** — probes each of `br` / `zstd` / `gzip` / `deflate` individually (separate `Accept-Encoding` request per algorithm) and measures actual wire bytes via `stream=True`. Reports compressed size and savings vs identity baseline. PASS if `br`/`zstd` supported, WARN if only `gzip`/`deflate`, FAIL if none
+- **`mobile_content_parity`** (PageSpeed-style) — refetches the URL with an iPhone Safari UA; flags mobile-UA blocks, m./mobile subdomain redirects (legacy pattern — prefer responsive design), and HTML-size divergence >3× or <0.3× from desktop (possible cloaking)
+- **`responsive_images_srcset`** — `<img>` elements use `srcset` or `<picture><source>` so mobile users don't download desktop-size images. PASS ≥70%, WARN ≥30%, FAIL <30%
 
 ### Security / TLS / DNS
 
