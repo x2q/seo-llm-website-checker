@@ -1,6 +1,6 @@
 # seo-llm-website-checker
 
-Single-file Python CLI that runs ~65 checks on a live website and reports issues as a markdown table (or JSON). Covers the same ground as a single-page Ahrefs / Screaming Frog / Sitebulb / Lighthouse / Google Search Console audit — plus Google Search Console "why pages aren't indexed" reasons, IPv4/IPv6 dual-stack, email DNS hygiene (MX/SPF/DKIM/DMARC), and LLM-specific signals (`llms.txt`, AI crawler access, citable facts). No headless browser — just HTTP, HTML parsing, and DNS.
+Single-file Python CLI that runs ~85 checks on a live website and reports issues as a markdown table (or JSON). Covers the same ground as a single-page Ahrefs / Screaming Frog / Sitebulb / Lighthouse / Google Search Console audit — plus Google Search Console "why pages aren't indexed" reasons, IPv4/IPv6 dual-stack, TLS cert + protocol, DNSSEC/CAA, CSP/COOP/COEP/SRI headers, accessibility basics (heading order, form labels, landmarks), privacy (trackers, cookie flags), email DNS hygiene (MX/SPF/DKIM/DMARC), and LLM-specific signals (`llms.txt`, AI crawler access, citable facts). No headless browser — just HTTP, HTML parsing, DNS, and `ssl`.
 
 ## Install
 
@@ -68,6 +68,8 @@ A live stderr progress bar renders while checks run (`[████░░░░]
 - **External `target="_blank"` links have `rel="noopener"`** (security — Lighthouse, Screaming Frog)
 - **Descriptive link text** — fewer than 20% of anchors are "click here" / "read more" / "læs mere" / bare URLs (Lighthouse `link-text`)
 - **Text-to-HTML ratio** — ≥10% visible text and ≥50 words (thin-content guard)
+- **`breadcrumb_schema`** — `BreadcrumbList` JSON-LD well-formed (≥2 items, each with `position`/`name`/`item`)
+- **`product_schema`** — if `Product` JSON-LD present, requires `name` + `image` + one of `offers`/`aggregateRating`/`review`; `offers` must have `price` + `priceCurrency` + `availability`
 
 ### LLM-readiness
 
@@ -90,6 +92,33 @@ A live stderr progress bar renders while checks run (`[████░░░░]
 - **DOM size + depth** — WARN >1500 elements or depth >32, FAIL >3000 or depth >60 (Lighthouse `dom-size`)
 - No dev CDNs (e.g. `cdn.tailwindcss.com`) in `<head>`
 - First `<img>` has `fetchpriority=high`/`loading=eager`, or a `<link rel=preload as=image>` is set (LCP)
+- **`http2_http3`** — ALPN negotiates `h2`; `Alt-Svc` header advertises `h3`. FAIL on `http/1.1` only
+- **`compression`** — HTML served with `br`/`zstd` (modern) or `gzip`. FAIL if ≥10 KB HTML is uncompressed
+
+### Security / TLS / DNS
+
+- **`tls_cert_expiry`** — days until `notAfter`: FAIL <15d, WARN <30d (SSL Labs)
+- **`tls_cert_hostname_match`** — hostname in cert `subjectAltName`; CN-only is WARN (deprecated since 2017)
+- **`tls_protocol_version`** — server still accepts TLS 1.0/1.1 → FAIL; TLS 1.3 not accepted → WARN; TLS 1.2+1.3 only → PASS
+- **`tls_chain_completeness`** — server sent intermediate cert(s), not just leaf (needs Python 3.13+)
+- **`hsts_preload_ready`** — HSTS meets hstspreload.org criteria: `max-age ≥ 31536000`, `includeSubDomains`, `preload`
+- **`caa_record`** — domain publishes CAA DNS record restricting which CAs can issue certs
+- **`dnssec`** — parent zone returns DS record for the apex (zone is DNSSEC-signed)
+- **`csp_unsafe_inline`** — CSP doesn't allow `'unsafe-inline'`/`'unsafe-eval'` in `script-src` (unless nonce/hash/strict-dynamic)
+- **`cross_origin_isolation`** — `Cross-Origin-Opener-Policy: same-origin` + `Cross-Origin-Embedder-Policy: require-corp` (enables SharedArrayBuffer, prevents XS-Leaks)
+- **`subresource_integrity`** — every cross-origin `<script>`/`<link rel=stylesheet>` has `integrity="sha…"`
+
+### Accessibility
+
+- **`heading_hierarchy`** — exactly one `<h1>`, no skipped levels (Lighthouse `heading-order`)
+- **`form_inputs_labeled`** — every `<input>`/`<select>`/`<textarea>` has `<label for>`, wrapping `<label>`, `aria-label`, or `aria-labelledby`
+- **`landmark_regions`** — exactly one `<main>` (or `role=main`) + `<nav>`
+- **`button_accessible_name`** — every `<button>` / `<a href>` has visible text, `aria-label`, `aria-labelledby`, or nested `<img alt>`
+
+### Privacy
+
+- **`third_party_trackers`** — counts third-party hosts and flags known trackers (GA, GTM, Facebook, Hotjar, Clarity, Mixpanel, Segment, TikTok, LinkedIn, Pinterest, Amplitude, FullStory). FAIL if trackers present and no cookie banner detected
+- **`cookie_flags`** — every `Set-Cookie` on HTTPS has `Secure` + `HttpOnly` + `SameSite`
 
 ### Email / DNS
 

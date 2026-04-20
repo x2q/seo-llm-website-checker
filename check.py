@@ -14,10 +14,12 @@ import argparse
 import json
 import re
 import socket
+import ssl
 import sys
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, asdict
-from typing import Callable, Iterable, Optional
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timezone
+from typing import Any, Callable, Iterable, Optional
 from urllib.parse import urljoin, urlparse, urlunparse, quote
 from xml.etree import ElementTree as ET
 
@@ -78,6 +80,7 @@ class Site:
     robots_status: Optional[int]
     robots_url: str
     session: requests.Session
+    tls_info: Optional[dict] = None
 
 
 # --------- helpers ---------
@@ -222,6 +225,624 @@ def check_dual_stack_assets(s: Site) -> CheckResult:
                            f"{', '.join(v6_missing[:3])}")
     return CheckResult("dual_stack_assets", "shared", PASS,
                        f"{len(results)} asset host(s) all dual-stack (A + AAAA)")
+
+
+# ---------- Security: TLS / cert / DNS-security / HTTP headers ----------
+
+
+def _tls_probe(host: str, port: int = 443, timeout: float = 6.0) -> dict:
+    """Establish a TLS connection and return cert + version + alpn + chain info."""
+    ctx = ssl.create_default_context()
+    ctx.set_alpn_protocols(["h2", "http/1.1"])
+    info: dict[str, Any] = {"error": None}
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ssock:
+                info["cert"] = ssock.getpeercert()
+                info["version"] = ssock.version()
+                info["alpn"] = ssock.selected_alpn_protocol()
+                info["cipher"] = ssock.cipher()
+                # Python 3.10+: list of certs the server actually sent
+                if hasattr(ssock, "get_unverified_chain"):
+                    try:
+                        chain = ssock.get_unverified_chain() or []
+                        info["chain_length"] = len(chain)
+                    except Exception:
+                        info["chain_length"] = None
+                else:
+                    info["chain_length"] = None
+    except (ssl.SSLError, ssl.CertificateError, OSError, socket.timeout) as e:
+        info["error"] = f"{type(e).__name__}: {e}"
+    return info
+
+
+def _tls_version_accepted(host: str, port: int, version: ssl.TLSVersion,
+                          timeout: float = 4.0) -> bool:
+    """True if the server accepts a connection restricted to exactly this TLS version."""
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    try:
+        ctx.minimum_version = version
+        ctx.maximum_version = version
+    except ValueError:
+        return False
+    try:
+        with socket.create_connection((host, port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host):
+                return True
+    except (ssl.SSLError, OSError, socket.timeout):
+        return False
+
+
+def check_tls_cert_expiry(s: Site) -> CheckResult:
+    if not s.tls_info or s.tls_info.get("error"):
+        return CheckResult("tls_cert_expiry", "security", FAIL,
+                           f"TLS connect failed: {s.tls_info.get('error') if s.tls_info else 'no probe'}")
+    cert = s.tls_info.get("cert") or {}
+    not_after = cert.get("notAfter")
+    if not not_after:
+        return CheckResult("tls_cert_expiry", "security", WARN, "no notAfter in cert")
+    expiry = datetime.strptime(not_after, "%b %d %H:%M:%S %Y %Z").replace(tzinfo=timezone.utc)
+    days = (expiry - datetime.now(timezone.utc)).days
+    when = expiry.strftime("%Y-%m-%d")
+    if days < 0:
+        return CheckResult("tls_cert_expiry", "security", FAIL, f"EXPIRED {-days} days ago ({when})")
+    if days < 15:
+        return CheckResult("tls_cert_expiry", "security", FAIL,
+                           f"expires in {days} days ({when}) — renew now")
+    if days < 30:
+        return CheckResult("tls_cert_expiry", "security", WARN,
+                           f"expires in {days} days ({when})")
+    return CheckResult("tls_cert_expiry", "security", PASS,
+                       f"expires in {days} days ({when})")
+
+
+def check_tls_cert_hostname(s: Site) -> CheckResult:
+    if not s.tls_info or s.tls_info.get("error"):
+        return CheckResult("tls_cert_hostname_match", "security", FAIL,
+                           "TLS connect failed")
+    cert = s.tls_info.get("cert") or {}
+    host = urlparse(s.final_url).hostname or ""
+    san_entries = cert.get("subjectAltName") or []
+    sans = [v for k, v in san_entries if k == "DNS"]
+    cn = ""
+    for rdn in cert.get("subject", []):
+        for k, v in rdn:
+            if k == "commonName":
+                cn = v
+    # exact or wildcard match
+    def matches(pattern: str, h: str) -> bool:
+        if pattern == h:
+            return True
+        if pattern.startswith("*."):
+            return h.count(".") == pattern.count(".") and h.endswith(pattern[1:])
+        return False
+
+    if any(matches(s, host) for s in sans):
+        return CheckResult("tls_cert_hostname_match", "security", PASS,
+                           f"{host} in SAN ({len(sans)} entries)")
+    if cn and matches(cn, host):
+        return CheckResult("tls_cert_hostname_match", "security", WARN,
+                           f"{host} matches CN only (SAN required since 2017)")
+    return CheckResult("tls_cert_hostname_match", "security", FAIL,
+                       f"{host} not in SAN {sans!r} or CN {cn!r}")
+
+
+def check_tls_protocol_version(s: Site) -> CheckResult:
+    if not s.tls_info or s.tls_info.get("error"):
+        return CheckResult("tls_protocol_version", "security", FAIL,
+                           "TLS connect failed")
+    negotiated = s.tls_info.get("version") or ""
+    host = urlparse(s.final_url).hostname or ""
+    # Check if server still accepts deprecated TLS versions
+    accepts_10 = _tls_version_accepted(host, 443, ssl.TLSVersion.TLSv1)
+    accepts_11 = _tls_version_accepted(host, 443, ssl.TLSVersion.TLSv1_1)
+    accepts_13 = _tls_version_accepted(host, 443, ssl.TLSVersion.TLSv1_3)
+    deprecated = []
+    if accepts_10:
+        deprecated.append("TLS 1.0")
+    if accepts_11:
+        deprecated.append("TLS 1.1")
+    if deprecated:
+        return CheckResult("tls_protocol_version", "security", FAIL,
+                           f"negotiated {negotiated}; still accepts {', '.join(deprecated)} "
+                           "(PCI/industry requires ≥1.2)")
+    if not accepts_13:
+        return CheckResult("tls_protocol_version", "security", WARN,
+                           f"negotiated {negotiated}; TLS 1.3 not accepted (recommended for modern perf)")
+    return CheckResult("tls_protocol_version", "security", PASS,
+                       f"TLS 1.3 + 1.2 only; negotiated {negotiated}")
+
+
+def check_tls_chain_completeness(s: Site) -> CheckResult:
+    if not s.tls_info or s.tls_info.get("error"):
+        return CheckResult("tls_chain_completeness", "security", FAIL, "TLS connect failed")
+    chain_len = s.tls_info.get("chain_length")
+    if chain_len is None:
+        return CheckResult("tls_chain_completeness", "security", INFO,
+                           "chain inspection needs Python 3.13+ (get_unverified_chain)")
+    if chain_len <= 1:
+        return CheckResult("tls_chain_completeness", "security", FAIL,
+                           f"server sent only {chain_len} cert — missing intermediates; "
+                           "some older Android/Java clients will fail to verify")
+    return CheckResult("tls_chain_completeness", "security", PASS,
+                       f"chain length {chain_len} (leaf + intermediates)")
+
+
+def check_hsts_preload_ready(s: Site) -> CheckResult:
+    hsts = s.response.headers.get("Strict-Transport-Security", "")
+    if not hsts:
+        return CheckResult("hsts_preload_ready", "security", FAIL, "no HSTS header")
+    m = re.search(r"max-age=(\d+)", hsts)
+    age = int(m.group(1)) if m else 0
+    has_sub = "includeSubDomains" in hsts
+    has_preload = "preload" in hsts
+    issues = []
+    if age < 31536000:
+        issues.append(f"max-age={age} < 31536000 (1 year required)")
+    if not has_sub:
+        issues.append("missing includeSubDomains")
+    if not has_preload:
+        issues.append("missing preload token")
+    if issues:
+        status = WARN if has_preload else FAIL
+        return CheckResult("hsts_preload_ready", "security", status,
+                           f"not preload-eligible: {'; '.join(issues)}")
+    return CheckResult("hsts_preload_ready", "security", PASS,
+                       f"preload-eligible: {hsts}")
+
+
+def check_caa_record(s: Site) -> CheckResult:
+    domain = _email_domain(urlparse(s.final_url).hostname or "")
+    try:
+        import dns.resolver
+        import dns.exception
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = resolver.lifetime = 4.0
+        answer = resolver.resolve(domain, "CAA", raise_on_no_answer=False)
+        records = list(answer) if answer.rrset is not None else []
+    except dns.resolver.NXDOMAIN:
+        return CheckResult("caa_record", "security", INFO, f"NXDOMAIN for {domain}")
+    except (dns.resolver.NoNameservers, dns.exception.Timeout) as e:
+        return CheckResult("caa_record", "security", INFO, f"DNS error: {e}")
+    if records:
+        issuers = [str(r).strip() for r in records]
+        return CheckResult("caa_record", "security", PASS,
+                           f"{len(records)} CAA record(s): {issuers[0][:80]}")
+    return CheckResult("caa_record", "security", WARN,
+                       f"no CAA records — any CA can issue certs for {domain}")
+
+
+def check_dnssec(s: Site) -> CheckResult:
+    domain = _email_domain(urlparse(s.final_url).hostname or "")
+    try:
+        import dns.resolver
+        import dns.exception
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = resolver.lifetime = 4.0
+        answer = resolver.resolve(domain, "DS", raise_on_no_answer=False)
+        if answer.rrset is not None and len(answer) > 0:
+            return CheckResult("dnssec", "security", PASS,
+                               f"{len(list(answer))} DS record(s) — zone is DNSSEC-signed")
+    except dns.resolver.NXDOMAIN:
+        pass
+    except (dns.resolver.NoNameservers, dns.exception.Timeout) as e:
+        return CheckResult("dnssec", "security", INFO, f"DNS error: {e}")
+    return CheckResult("dnssec", "security", INFO,
+                       f"no DS record for {domain} — zone not DNSSEC-signed")
+
+
+def _parse_csp(header: str) -> dict[str, list[str]]:
+    directives: dict[str, list[str]] = {}
+    for part in header.split(";"):
+        tokens = part.strip().split()
+        if not tokens:
+            continue
+        directives[tokens[0].lower()] = tokens[1:]
+    return directives
+
+
+def check_csp_unsafe_inline(s: Site) -> CheckResult:
+    csp = s.response.headers.get("Content-Security-Policy", "")
+    if not csp:
+        return CheckResult("csp_unsafe_inline", "security", INFO,
+                           "no CSP header (reported by security_headers)")
+    d = _parse_csp(csp)
+    script = d.get("script-src") or d.get("script-src-elem") or d.get("default-src") or []
+    has_unsafe_inline = "'unsafe-inline'" in script
+    has_nonce = any(s.startswith("'nonce-") for s in script)
+    has_hash = any(s.startswith("'sha") for s in script)
+    has_strict_dynamic = "'strict-dynamic'" in script
+    has_unsafe_eval = "'unsafe-eval'" in script
+    issues = []
+    if has_unsafe_inline and not (has_nonce or has_hash or has_strict_dynamic):
+        issues.append("'unsafe-inline' in script-src without nonce/hash/strict-dynamic")
+    if has_unsafe_eval:
+        issues.append("'unsafe-eval' in script-src")
+    if issues:
+        return CheckResult("csp_unsafe_inline", "security",
+                           FAIL if has_unsafe_inline and not (has_nonce or has_hash or has_strict_dynamic) else WARN,
+                           "; ".join(issues))
+    return CheckResult("csp_unsafe_inline", "security", PASS,
+                       "script-src has no unsafe-inline / unsafe-eval")
+
+
+def check_cross_origin_isolation(s: Site) -> CheckResult:
+    coop = s.response.headers.get("Cross-Origin-Opener-Policy", "").strip()
+    coep = s.response.headers.get("Cross-Origin-Embedder-Policy", "").strip()
+    if coop == "same-origin" and coep in ("require-corp", "credentialless"):
+        return CheckResult("cross_origin_isolation", "security", PASS,
+                           f"isolated: COOP={coop} COEP={coep}")
+    if coop == "same-origin":
+        return CheckResult("cross_origin_isolation", "security", WARN,
+                           f"COOP={coop} but COEP missing/weak ({coep!r})")
+    if not coop and not coep:
+        return CheckResult("cross_origin_isolation", "security", INFO,
+                           "no COOP/COEP (only needed for SharedArrayBuffer / high-res timers)")
+    return CheckResult("cross_origin_isolation", "security", INFO,
+                       f"partial: COOP={coop!r} COEP={coep!r}")
+
+
+def check_subresource_integrity(s: Site) -> CheckResult:
+    host = urlparse(s.final_url).hostname or ""
+    missing: list[str] = []
+    total_xorig = 0
+    # cross-origin scripts
+    for sc in s.soup.find_all("script", src=True):
+        src = sc["src"]
+        url = urljoin(s.final_url, src)
+        url_host = urlparse(url).hostname
+        if url_host and url_host != host:
+            total_xorig += 1
+            if not sc.get("integrity"):
+                missing.append(f"<script src={src[:60]}>")
+    # cross-origin stylesheets
+    for link in s.soup.find_all("link", href=True):
+        rel = link.get("rel") or []
+        if "stylesheet" not in [r.lower() for r in rel]:
+            continue
+        url = urljoin(s.final_url, link["href"])
+        url_host = urlparse(url).hostname
+        if url_host and url_host != host:
+            total_xorig += 1
+            if not link.get("integrity"):
+                missing.append(f"<link href={link['href'][:60]}>")
+    if total_xorig == 0:
+        return CheckResult("subresource_integrity", "security", INFO,
+                           "no cross-origin scripts or stylesheets")
+    if missing:
+        return CheckResult("subresource_integrity", "security", WARN,
+                           f"{len(missing)}/{total_xorig} cross-origin assets without integrity: {missing[0]}")
+    return CheckResult("subresource_integrity", "security", PASS,
+                       f"{total_xorig} cross-origin assets all have SRI")
+
+
+# ---------- SEO rich-result schemas + perf (HTTP/2-3, compression) ----------
+
+
+def _collect_jsonld(s: Site) -> list[dict]:
+    """Return all JSON-LD nodes flattened through @graph."""
+    out: list[dict] = []
+    for sc in s.soup.find_all("script", attrs={"type": "application/ld+json"}):
+        if not sc.string or sc.get("src"):
+            continue
+        try:
+            data = json.loads(sc.string)
+        except json.JSONDecodeError:
+            continue
+
+        def walk(node) -> None:
+            if isinstance(node, list):
+                for n in node:
+                    walk(n)
+                return
+            if not isinstance(node, dict):
+                return
+            out.append(node)
+            if "@graph" in node:
+                walk(node["@graph"])
+        walk(data)
+    return out
+
+
+def _is_type(node: dict, name: str) -> bool:
+    t = node.get("@type")
+    if isinstance(t, list):
+        return name in t
+    return t == name
+
+
+def check_breadcrumb_schema(s: Site) -> CheckResult:
+    nodes = _collect_jsonld(s)
+    crumbs = [n for n in nodes if _is_type(n, "BreadcrumbList")]
+    if not crumbs:
+        return CheckResult("breadcrumb_schema", "seo", INFO, "no BreadcrumbList JSON-LD")
+    for bc in crumbs:
+        items = bc.get("itemListElement") or []
+        if not isinstance(items, list) or len(items) < 2:
+            return CheckResult("breadcrumb_schema", "seo", FAIL,
+                               f"BreadcrumbList needs ≥2 items, got {len(items) if isinstance(items, list) else '?'}")
+        for it in items:
+            if not isinstance(it, dict):
+                return CheckResult("breadcrumb_schema", "seo", FAIL,
+                                   "BreadcrumbList itemListElement is not a list of objects")
+            missing = [f for f in ("position", "name", "item") if f not in it]
+            if missing and "item" not in missing:
+                # some pages omit 'item' on the last breadcrumb; that's allowed
+                missing = [m for m in missing if m != "item"]
+            if missing:
+                return CheckResult("breadcrumb_schema", "seo", FAIL,
+                                   f"BreadcrumbList item missing {missing}")
+    total = sum(len(bc.get("itemListElement") or []) for bc in crumbs)
+    return CheckResult("breadcrumb_schema", "seo", PASS,
+                       f"{len(crumbs)} BreadcrumbList(s) with {total} items")
+
+
+def check_product_schema(s: Site) -> CheckResult:
+    nodes = _collect_jsonld(s)
+    products = [n for n in nodes if _is_type(n, "Product")]
+    if not products:
+        return CheckResult("product_schema", "seo", INFO, "no Product JSON-LD")
+    issues: list[str] = []
+    for p in products:
+        required = [f for f in ("name", "image") if not p.get(f)]
+        if required:
+            issues.append(f"missing {required}")
+            continue
+        has_offer = bool(p.get("offers"))
+        has_rating = bool(p.get("aggregateRating"))
+        has_review = bool(p.get("review"))
+        if not (has_offer or has_rating or has_review):
+            issues.append("needs one of offers/aggregateRating/review")
+            continue
+        if has_offer:
+            offers = p["offers"] if isinstance(p["offers"], list) else [p["offers"]]
+            for o in offers:
+                if not isinstance(o, dict):
+                    issues.append("malformed offers")
+                    continue
+                off_missing = [f for f in ("price", "priceCurrency", "availability")
+                               if not o.get(f)]
+                if off_missing:
+                    issues.append(f"offer missing {off_missing}")
+    if issues:
+        return CheckResult("product_schema", "seo", FAIL,
+                           f"{len(products)} Product(s); {issues[0]}")
+    return CheckResult("product_schema", "seo", PASS,
+                       f"{len(products)} Product schema(s) complete")
+
+
+def check_http2_http3(s: Site) -> CheckResult:
+    """ALPN negotiates h2; Alt-Svc advertises h3."""
+    alpn = (s.tls_info or {}).get("alpn") if s.tls_info else None
+    alt_svc = s.response.headers.get("Alt-Svc", "")
+    if alpn == "h2":
+        if "h3" in alt_svc:
+            return CheckResult("http2_http3", "perf", PASS,
+                               f"ALPN=h2, Alt-Svc advertises h3: {alt_svc[:80]}")
+        return CheckResult("http2_http3", "perf", WARN,
+                           "ALPN=h2 but no h3 in Alt-Svc — HTTP/3 recommended")
+    if alpn is None:
+        return CheckResult("http2_http3", "perf", INFO, "no TLS probe (http site)")
+    return CheckResult("http2_http3", "perf", FAIL,
+                       f"ALPN={alpn or 'http/1.1'} — HTTP/2 not supported")
+
+
+def check_compression(s: Site) -> CheckResult:
+    """HTML served with gzip / br / zstd when encoded."""
+    enc = s.response.headers.get("Content-Encoding", "").lower()
+    size = len(s.response.content)
+    if size < 10 * 1024:
+        return CheckResult("compression", "perf", INFO,
+                           f"HTML {size // 1024} KB — too small to matter")
+    if enc in ("br", "zstd"):
+        return CheckResult("compression", "perf", PASS,
+                           f"Content-Encoding={enc} (modern)")
+    if enc == "gzip":
+        return CheckResult("compression", "perf", WARN,
+                           f"Content-Encoding=gzip — consider br/zstd (~15-20% smaller)")
+    return CheckResult("compression", "perf", FAIL,
+                       f"HTML {size // 1024} KB served uncompressed — enable gzip/brotli")
+
+
+# ---------- Accessibility (a11y) ----------
+
+
+def check_heading_hierarchy(s: Site) -> CheckResult:
+    """Exactly one <h1>, no skipped levels (e.g. H2 → H4)."""
+    headings = s.soup.find_all(re.compile("^h[1-6]$"))
+    if not headings:
+        return CheckResult("heading_hierarchy", "a11y", FAIL, "no headings on page")
+    levels = [int(h.name[1]) for h in headings]
+    h1_count = levels.count(1)
+    if h1_count == 0:
+        return CheckResult("heading_hierarchy", "a11y", FAIL, "no <h1>")
+    # check for skipped levels
+    skips = []
+    for i in range(1, len(levels)):
+        if levels[i] > levels[i - 1] + 1:
+            skips.append(f"h{levels[i-1]} → h{levels[i]}")
+    if h1_count > 1:
+        return CheckResult("heading_hierarchy", "a11y", WARN,
+                           f"{h1_count} <h1> elements" + (f"; skips: {skips[0]}" if skips else ""))
+    if skips:
+        return CheckResult("heading_hierarchy", "a11y", WARN,
+                           f"skipped heading level(s): {', '.join(skips[:3])}")
+    return CheckResult("heading_hierarchy", "a11y", PASS,
+                       f"{len(headings)} headings, levels {sorted(set(levels))}")
+
+
+def check_form_inputs_labeled(s: Site) -> CheckResult:
+    """Every interactive form control has an accessible name."""
+    skip_types = {"hidden", "submit", "button", "reset", "image"}
+    inputs = []
+    for tag in ("input", "select", "textarea"):
+        for el in s.soup.find_all(tag):
+            if tag == "input" and (el.get("type") or "text").lower() in skip_types:
+                continue
+            inputs.append(el)
+    if not inputs:
+        return CheckResult("form_inputs_labeled", "a11y", INFO, "no form inputs on page")
+    # build id → <label for=> map
+    label_ids: set[str] = set()
+    for lab in s.soup.find_all("label", attrs={"for": True}):
+        label_ids.add(lab["for"])
+    unlabeled: list[str] = []
+    for el in inputs:
+        if el.get("aria-label") or el.get("aria-labelledby") or el.get("title"):
+            continue
+        if el.get("id") and el["id"] in label_ids:
+            continue
+        # wrapped inside a <label>?
+        if el.find_parent("label"):
+            continue
+        name = el.get("name") or el.get("id") or el.get("type") or el.name
+        unlabeled.append(f"<{el.name} {name}>")
+    if unlabeled:
+        return CheckResult("form_inputs_labeled", "a11y", FAIL,
+                           f"{len(unlabeled)}/{len(inputs)} inputs unlabeled: {unlabeled[0]}")
+    return CheckResult("form_inputs_labeled", "a11y", PASS,
+                       f"{len(inputs)} inputs all have accessible names")
+
+
+def check_landmark_regions(s: Site) -> CheckResult:
+    mains = s.soup.find_all("main") + s.soup.find_all(attrs={"role": "main"})
+    navs = s.soup.find_all("nav") + s.soup.find_all(attrs={"role": "navigation"})
+    if len(mains) == 0:
+        return CheckResult("landmark_regions", "a11y", FAIL,
+                           "no <main> or role=main — screen readers can't find primary content")
+    if len(mains) > 1:
+        return CheckResult("landmark_regions", "a11y", WARN,
+                           f"{len(mains)} <main> regions (should be exactly 1)")
+    if not navs:
+        return CheckResult("landmark_regions", "a11y", WARN,
+                           "no <nav> landmark")
+    return CheckResult("landmark_regions", "a11y", PASS,
+                       f"1 <main>, {len(navs)} <nav>")
+
+
+def check_button_accessible_name(s: Site) -> CheckResult:
+    """Every <button> and <a href> has a visible name, aria-label, or aria-labelledby."""
+    nameless: list[str] = []
+    for tag in ("button", "a"):
+        for el in s.soup.find_all(tag):
+            if tag == "a" and not el.get("href"):
+                continue
+            txt = el.get_text(" ", strip=True)
+            if txt:
+                continue
+            if el.get("aria-label") or el.get("aria-labelledby") or el.get("title"):
+                continue
+            # check nested <img alt>
+            img = el.find("img")
+            if img and (img.get("alt") or "").strip():
+                continue
+            # nested <svg> with role=img and <title>
+            svg = el.find("svg")
+            if svg and (svg.get("aria-label") or svg.find("title")):
+                continue
+            snippet = str(el)[:60].replace("\n", " ")
+            nameless.append(snippet)
+    if nameless:
+        return CheckResult("button_accessible_name", "a11y", FAIL,
+                           f"{len(nameless)} button(s)/link(s) with no accessible name: {nameless[0]}")
+    return CheckResult("button_accessible_name", "a11y", PASS,
+                       "all buttons and links have accessible names")
+
+
+# ---------- Privacy ----------
+
+KNOWN_TRACKERS = {
+    "google-analytics.com": "Google Analytics",
+    "googletagmanager.com": "Google Tag Manager",
+    "doubleclick.net": "Google Ads / DoubleClick",
+    "facebook.net": "Facebook Pixel",
+    "connect.facebook.net": "Facebook Pixel",
+    "hotjar.com": "Hotjar",
+    "static.hotjar.com": "Hotjar",
+    "clarity.ms": "Microsoft Clarity",
+    "mixpanel.com": "Mixpanel",
+    "segment.com": "Segment",
+    "analytics.tiktok.com": "TikTok Pixel",
+    "snap.licdn.com": "LinkedIn Insight",
+    "ads.linkedin.com": "LinkedIn Ads",
+    "pinimg.com": "Pinterest Tag",
+    "amplitude.com": "Amplitude",
+    "fullstory.com": "FullStory",
+}
+
+
+def check_third_party_trackers(s: Site) -> CheckResult:
+    """Third-party hosts + known trackers on the page. Flag trackers that load
+    before any cookie-consent UI (heuristic)."""
+    host = urlparse(s.final_url).hostname or ""
+    third_party_hosts: set[str] = set()
+    for tag, attr in [("script", "src"), ("img", "src"), ("iframe", "src"), ("link", "href")]:
+        for el in s.soup.find_all(tag, attrs={attr: True}):
+            url = urljoin(s.final_url, el[attr])
+            h = urlparse(url).hostname
+            if h and h != host:
+                third_party_hosts.add(h)
+    # match known trackers
+    trackers_found: list[str] = []
+    for h in third_party_hosts:
+        for domain, name in KNOWN_TRACKERS.items():
+            if h == domain or h.endswith("." + domain):
+                trackers_found.append(name)
+                break
+    trackers_found = sorted(set(trackers_found))
+    # heuristic: does the page mention a cookie banner?
+    page_text = s.soup.get_text(" ", strip=True).lower()
+    has_banner = any(s in page_text for s in
+                     ("cookie", "consent", "accepter", "samtykke", "privatliv"))
+    if trackers_found and not has_banner:
+        return CheckResult("third_party_trackers", "privacy", FAIL,
+                           f"{len(trackers_found)} tracker(s) + no cookie banner detected: "
+                           f"{', '.join(trackers_found)} (GDPR/ePrivacy requires consent)")
+    if len(third_party_hosts) > 10:
+        return CheckResult("third_party_trackers", "privacy", WARN,
+                           f"{len(third_party_hosts)} third-party hosts; "
+                           f"trackers: {', '.join(trackers_found) or 'none known'}")
+    if trackers_found:
+        return CheckResult("third_party_trackers", "privacy", WARN,
+                           f"{len(trackers_found)} tracker(s) present (consent banner detected): "
+                           f"{', '.join(trackers_found)}")
+    return CheckResult("third_party_trackers", "privacy", PASS,
+                       f"{len(third_party_hosts)} third-party host(s), no known trackers")
+
+
+def check_cookie_flags(s: Site) -> CheckResult:
+    """Set-Cookie flags on the HTTPS response: Secure + HttpOnly + SameSite."""
+    # get all Set-Cookie values preserving multiples
+    raw_headers = s.response.raw.headers.getlist("Set-Cookie") if hasattr(
+        s.response.raw.headers, "getlist") else [s.response.headers.get("Set-Cookie", "")]
+    cookies = [h for h in raw_headers if h]
+    if not cookies:
+        return CheckResult("cookie_flags", "privacy", INFO, "no cookies set on response")
+    is_https = s.final_url.startswith("https://")
+    issues: list[str] = []
+    for c in cookies:
+        name = c.split("=", 1)[0].strip()
+        low = c.lower()
+        missing: list[str] = []
+        if is_https and "; secure" not in low and not low.endswith(";secure"):
+            missing.append("Secure")
+        if "; httponly" not in low and "httponly" not in low.split(";")[0]:
+            if not re.search(r"(?i)\bhttponly\b", c):
+                missing.append("HttpOnly")
+        if not re.search(r"(?i)\bsamesite\s*=", c):
+            missing.append("SameSite")
+        if missing:
+            issues.append(f"{name}: missing {','.join(missing)}")
+    if any("Secure" in i for i in issues) and is_https:
+        return CheckResult("cookie_flags", "privacy", FAIL,
+                           f"{len(issues)}/{len(cookies)} cookie(s) missing flags: {issues[0]}")
+    if issues:
+        return CheckResult("cookie_flags", "privacy", WARN,
+                           f"{len(issues)}/{len(cookies)} cookie(s) missing flags: {issues[0]}")
+    return CheckResult("cookie_flags", "privacy", PASS,
+                       f"{len(cookies)} cookie(s) all Secure + HttpOnly + SameSite")
 
 
 # ---------- Email DNS checks (MX, SPF, DKIM, DMARC, MTA-STS) ----------
@@ -1804,9 +2425,20 @@ CHECKS: list[CheckFn] = [
     check_twitter_card, check_json_ld, check_hreflang,
     check_outgoing_links_present, check_external_link_safety,
     check_descriptive_link_text, check_text_to_html_ratio,
+    check_breadcrumb_schema, check_product_schema,
     # llm
     check_llms_txt, check_llms_full_txt, check_ai_crawlers,
     check_citable_facts, check_faq_schema,
+    # security
+    check_tls_cert_expiry, check_tls_cert_hostname, check_tls_protocol_version,
+    check_tls_chain_completeness, check_hsts_preload_ready,
+    check_caa_record, check_dnssec,
+    check_csp_unsafe_inline, check_cross_origin_isolation, check_subresource_integrity,
+    # a11y
+    check_heading_hierarchy, check_form_inputs_labeled,
+    check_landmark_regions, check_button_accessible_name,
+    # privacy
+    check_third_party_trackers, check_cookie_flags,
     # email
     check_mx_records, check_spf_record, check_dmarc_record,
     check_dkim_record, check_mta_sts,
@@ -1816,6 +2448,7 @@ CHECKS: list[CheckFn] = [
     check_css_sizes, check_js_assets_reachable,
     check_inline_asset_size, check_dom_size,
     check_render_blocking, check_lcp_hints,
+    check_http2_http3, check_compression,
 ]
 
 
@@ -1833,9 +2466,15 @@ def build_site(url: str) -> Site:
             robots = rr.text
     except requests.RequestException:
         pass
+    # one TLS probe, reused by every security check
+    tls_info: Optional[dict] = None
+    parsed = urlparse(r.url)
+    if parsed.scheme == "https" and parsed.hostname:
+        tls_info = _tls_probe(parsed.hostname, parsed.port or 443)
     return Site(url=url, final_url=r.url, response=r, soup=soup,
                 robots_text=robots, robots_content_type=robots_ct,
-                robots_status=robots_status, robots_url=robots_url, session=session)
+                robots_status=robots_status, robots_url=robots_url, session=session,
+                tls_info=tls_info)
 
 
 class ProgressBar:
@@ -1886,7 +2525,8 @@ def run_all(url: str, progress: bool = True) -> list[CheckResult]:
         results.append(r)
         bar.tick(r)
     bar.close()
-    order = {"shared": 0, "seo": 1, "llm": 2, "perf": 3, "email": 4}
+    order = {"shared": 0, "security": 1, "seo": 2, "llm": 3, "perf": 4,
+             "a11y": 5, "privacy": 6, "email": 7}
     results.sort(key=lambda r: (order.get(r.category, 9), r.check))
     return results
 
@@ -1894,9 +2534,10 @@ def run_all(url: str, progress: bool = True) -> list[CheckResult]:
 def render_markdown(url: str, results: Iterable[CheckResult]) -> str:
     results = list(results)
     lines = [f"# SEO + LLM check: {url}\n"]
-    categories = [("shared", "Shared / Transport"), ("seo", "SEO"),
-                  ("llm", "LLM-readiness"), ("perf", "Performance"),
-                  ("email", "Email / DNS")]
+    categories = [("shared", "Shared / Transport"), ("security", "Security / TLS / DNS"),
+                  ("seo", "SEO"), ("llm", "LLM-readiness"),
+                  ("perf", "Performance"), ("a11y", "Accessibility"),
+                  ("privacy", "Privacy"), ("email", "Email / DNS")]
     for cat, label in categories:
         rows = [r for r in results if r.category == cat]
         if not rows:
