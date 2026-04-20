@@ -84,6 +84,8 @@ class Site:
     session: requests.Session
     tls_info: Optional[dict] = None
     browser_result: Optional[dict] = None
+    ads_deep: bool = False
+    browser_pool_ref: Optional["BrowserPool"] = None
 
 
 # --------- helpers ---------
@@ -2754,6 +2756,456 @@ def check_image_modern_format(s: Site) -> CheckResult:
 
 CheckFn = Callable[[Site], CheckResult]
 
+# ---------- Ads / tracking / martech detection (HTML signature scan) ----------
+
+# Each entry: { name, label, patterns (any-of, regex, case-insensitive), id_regex (optional),
+#               warn_on_found (optional), warn_msg (optional) }
+
+ADS_PIXEL_SIGNATURES: list[dict] = [
+    {"name": "meta_pixel", "label": "Meta (Facebook) Pixel",
+     "patterns": [r"connect\.facebook\.net/[^/]+/fbevents\.js", r"\bfbq\s*\("],
+     "id_regex": r"fbq\s*\(\s*['\"]init['\"]\s*,\s*['\"](\d{6,})['\"]"},
+    {"name": "google_ads", "label": "Google Ads",
+     "patterns": [r"googletagmanager\.com/gtag/js\?id=AW-", r"\bgoogle_conversion_id\b", r"\bAW-\d{6,}\b"],
+     "id_regex": r"(AW-\d{6,})"},
+    {"name": "google_tag_manager", "label": "Google Tag Manager",
+     "patterns": [r"googletagmanager\.com/gtm\.js\?id=GTM-"],
+     "id_regex": r"(GTM-[A-Z0-9]+)"},
+    {"name": "linkedin_insight", "label": "LinkedIn Insight",
+     "patterns": [r"snap\.licdn\.com/li\.lms-analytics/insight\.min\.js",
+                  r"_linkedin_data_partner_ids"],
+     "id_regex": r"_linkedin_data_partner_ids\s*=\s*\[\s*['\"]?(\d+)"},
+    {"name": "tiktok_pixel", "label": "TikTok Pixel",
+     "patterns": [r"analytics\.tiktok\.com/i18n/pixel/events\.js", r"\bttq\.load\s*\("],
+     "id_regex": r"ttq\.load\s*\(\s*['\"]([A-Z0-9]+)['\"]"},
+    {"name": "pinterest_tag", "label": "Pinterest Tag",
+     "patterns": [r"s\.pinimg\.com/ct/core\.js", r"\bpintrk\s*\(\s*['\"]load['\"]"],
+     "id_regex": r"pintrk\s*\(\s*['\"]load['\"]\s*,\s*['\"](\d+)['\"]"},
+    {"name": "snapchat_pixel", "label": "Snapchat Pixel",
+     "patterns": [r"sc-static\.net/scevent\.min\.js", r"\bsnaptr\s*\(\s*['\"]init['\"]"],
+     "id_regex": r"snaptr\s*\(\s*['\"]init['\"]\s*,\s*['\"]([a-f0-9-]+)['\"]"},
+    {"name": "reddit_pixel", "label": "Reddit Pixel",
+     "patterns": [r"redditstatic\.com/ads/pixel\.js", r"\brdt\s*\(\s*['\"]init['\"]"],
+     "id_regex": r"rdt\s*\(\s*['\"]init['\"]\s*,\s*['\"]([a-z0-9_]+)['\"]"},
+    {"name": "bing_uet", "label": "Microsoft Ads (Bing UET)",
+     "patterns": [r"bat\.bing\.com/bat\.js", r"\b(?:UET|uetq)\b"],
+     "id_regex": r"['\"]ti['\"]\s*:\s*['\"](\d+)['\"]"},
+    {"name": "x_twitter_pixel", "label": "X (Twitter) Pixel",
+     "patterns": [r"static\.ads-twitter\.com/uwt\.js", r"\btwq\s*\(\s*['\"]config['\"]"],
+     "id_regex": r"twq\s*\(\s*['\"]config['\"]\s*,\s*['\"]([a-z0-9]+)['\"]"},
+]
+
+TRACKING_SIGNATURES: list[dict] = [
+    {"name": "google_analytics_4", "label": "Google Analytics 4",
+     "patterns": [r"googletagmanager\.com/gtag/js\?id=G-",
+                  r"gtag\s*\(\s*['\"]config['\"]\s*,\s*['\"]G-"],
+     "id_regex": r"(G-[A-Z0-9]+)"},
+    {"name": "universal_analytics", "label": "Universal Analytics (legacy)",
+     "patterns": [r"\bUA-\d+-\d+\b"],
+     "id_regex": r"(UA-\d+-\d+)",
+     "warn_on_found": True,
+     "warn_msg": "sunset July 2024 — migrate to GA4"},
+    {"name": "segment", "label": "Segment",
+     "patterns": [r"cdn\.segment\.com/analytics\.js", r"\banalytics\.load\s*\("]},
+    {"name": "mixpanel", "label": "Mixpanel",
+     "patterns": [r"cdn\.mxpnl\.com", r"\bmixpanel\.init\s*\("]},
+    {"name": "hotjar", "label": "Hotjar",
+     "patterns": [r"static\.hotjar\.com/c/hotjar-", r"\bhjid\s*:"],
+     "id_regex": r"hjid\s*:\s*(\d+)"},
+    {"name": "microsoft_clarity", "label": "Microsoft Clarity",
+     "patterns": [r"www\.clarity\.ms/tag/", r"\bclarity\s*\(\s*['\"]set['\"]"]},
+    {"name": "plausible", "label": "Plausible Analytics",
+     "patterns": [r"plausible\.io/js/script", r"data-domain\s*="]},
+    {"name": "fathom", "label": "Fathom Analytics",
+     "patterns": [r"cdn\.usefathom\.com/script\.js"]},
+    {"name": "simple_analytics", "label": "Simple Analytics",
+     "patterns": [r"scripts\.simpleanalyticscdn\.com"]},
+    {"name": "cloudflare_analytics", "label": "Cloudflare Web Analytics",
+     "patterns": [r"static\.cloudflareinsights\.com/beacon\.min\.js"]},
+    {"name": "matomo", "label": "Matomo",
+     "patterns": [r"matomo\.js", r"\b_paq\.push\s*\(", r"piwik\.js"]},
+    {"name": "amplitude", "label": "Amplitude",
+     "patterns": [r"cdn\.amplitude\.com", r"amplitude\.getInstance"]},
+    {"name": "fullstory", "label": "FullStory",
+     "patterns": [r"fullstory\.com/s/fs\.js", r"\bFS\.identify\s*\("]},
+]
+
+MARTECH_SIGNATURES: list[dict] = [
+    # Consent Management Platforms (CMPs)
+    {"name": "cookiebot", "label": "Cookiebot CMP",
+     "patterns": [r"consent\.cookiebot\.com", r"data-cbid\s*="],
+     "id_regex": r"data-cbid\s*=\s*['\"]([a-f0-9-]+)"},
+    {"name": "onetrust", "label": "OneTrust CMP",
+     "patterns": [r"cdn\.cookielaw\.org", r"OneTrust\.AllowAll"]},
+    {"name": "usercentrics", "label": "Usercentrics CMP",
+     "patterns": [r"app\.usercentrics\.eu", r"usercentrics-root"]},
+    {"name": "didomi", "label": "Didomi CMP",
+     "patterns": [r"sdk\.privacy-center\.org", r"\bwindow\.didomiOnReady\b"]},
+    {"name": "iubenda", "label": "Iubenda CMP",
+     "patterns": [r"cs\.iubenda\.com", r"iubenda-cs-"]},
+    # Chat widgets
+    {"name": "intercom", "label": "Intercom",
+     "patterns": [r"widget\.intercom\.io", r"\bwindow\.Intercom\b"]},
+    {"name": "drift", "label": "Drift",
+     "patterns": [r"js\.driftt\.com/include", r"\bwindow\.drift\b"]},
+    {"name": "zendesk_chat", "label": "Zendesk Chat / Web Widget",
+     "patterns": [r"static\.zdassets\.com", r"zendeskChat", r"\bzE\s*\("]},
+    {"name": "crisp", "label": "Crisp Chat",
+     "patterns": [r"client\.crisp\.chat", r"\bCRISP_WEBSITE_ID\b"]},
+    {"name": "tawk", "label": "Tawk.to",
+     "patterns": [r"embed\.tawk\.to", r"\bTawk_API\b"]},
+    {"name": "hubspot_chat", "label": "HubSpot Chat",
+     "patterns": [r"js\.hs-scripts\.com", r"js\.hsadspixel\.net", r"hbspt\.forms"],
+     "id_regex": r"hs-scripts\.com/(\d+)\.js"},
+    # CRM / marketing automation scripts
+    {"name": "marketo", "label": "Marketo",
+     "patterns": [r"munchkin\.marketo\.net", r"\bMunchkin\.init\s*\("]},
+    {"name": "pardot", "label": "Pardot",
+     "patterns": [r"pi\.pardot\.com"]},
+    {"name": "activecampaign", "label": "ActiveCampaign",
+     "patterns": [r"trackcmp\.net", r"activehosted\.com"]},
+    {"name": "klaviyo", "label": "Klaviyo",
+     "patterns": [r"static\.klaviyo\.com", r"\bklaviyo\.init\s*\("]},
+    # CDPs
+    {"name": "rudderstack", "label": "RudderStack CDP",
+     "patterns": [r"cdn\.rudderlabs\.com"]},
+    {"name": "mparticle", "label": "mParticle CDP",
+     "patterns": [r"jssdkcdns\.mparticle\.com"]},
+]
+
+
+def _make_signature_check(sig: dict, category: str) -> CheckFn:
+    name = sig["name"]
+    label = sig["label"]
+    patterns = sig["patterns"]
+    id_regex = sig.get("id_regex")
+    warn_on_found = sig.get("warn_on_found", False)
+    warn_msg = sig.get("warn_msg", "")
+
+    def check(s: Site) -> CheckResult:
+        html = s.response.text
+        if not any(re.search(p, html, re.I) for p in patterns):
+            return CheckResult(name, category, INFO, f"{label} not detected")
+        id_str = ""
+        if id_regex:
+            # IDs are case-sensitive in their canonical form (G-XXXXXX, AW-XXXXX,
+            # GTM-XXX, UA-XXXX-Y, etc.) — don't use re.I or we match JS-bundle hashes
+            m = re.search(id_regex, html)
+            if m:
+                id_str = f" ({m.group(1)})"
+        if warn_on_found:
+            return CheckResult(name, category, WARN,
+                               f"{label}{id_str}" + (f" — {warn_msg}" if warn_msg else ""))
+        return CheckResult(name, category, PASS, f"{label}{id_str}")
+
+    check.__name__ = f"check_{name}"
+    return check
+
+
+_ADS_PIXEL_CHECKS: list[CheckFn] = [_make_signature_check(s, "ads") for s in ADS_PIXEL_SIGNATURES]
+_TRACKING_CHECKS: list[CheckFn] = [_make_signature_check(s, "tracking") for s in TRACKING_SIGNATURES]
+_MARTECH_CHECKS: list[CheckFn] = [_make_signature_check(s, "martech") for s in MARTECH_SIGNATURES]
+
+
+def check_ads_pixels_summary(s: Site) -> CheckResult:
+    html = s.response.text
+    found = [sig["label"] for sig in ADS_PIXEL_SIGNATURES
+             if any(re.search(p, html, re.I) for p in sig["patterns"])]
+    if not found:
+        return CheckResult("ads_pixels_summary", "ads", INFO, "no ads pixels detected")
+    return CheckResult("ads_pixels_summary", "ads", PASS,
+                       f"{len(found)} ads pixel(s): {', '.join(found)}")
+
+
+def check_tracking_summary(s: Site) -> CheckResult:
+    html = s.response.text
+    found = [sig["label"] for sig in TRACKING_SIGNATURES
+             if any(re.search(p, html, re.I) for p in sig["patterns"])]
+    if not found:
+        return CheckResult("tracking_summary", "tracking", INFO, "no analytics detected")
+    return CheckResult("tracking_summary", "tracking", PASS,
+                       f"{len(found)} analytics tool(s): {', '.join(found)}")
+
+
+def check_martech_summary(s: Site) -> CheckResult:
+    html = s.response.text
+    found = [sig["label"] for sig in MARTECH_SIGNATURES
+             if any(re.search(p, html, re.I) for p in sig["patterns"])]
+    if not found:
+        return CheckResult("martech_summary", "martech", INFO, "no martech detected")
+    return CheckResult("martech_summary", "martech", PASS,
+                       f"{len(found)} martech tool(s): {', '.join(found)}")
+
+
+# ---------- Authority / rank signals (free, no API keys) ----------
+
+WAYBACK_CDX_URL = "http://web.archive.org/cdx/search/cdx"
+
+
+def _registered_domain(host: str) -> str:
+    """Strip leading www. — not a full public-suffix resolver."""
+    return host[4:] if host.startswith("www.") else host
+
+
+def check_domain_age_wayback(s: Site) -> CheckResult:
+    host = urlparse(s.final_url).hostname or ""
+    domain = _registered_domain(host)
+    try:
+        r = s.session.get(WAYBACK_CDX_URL, params={
+            "url": domain, "output": "json", "limit": 1, "from": "19960101"
+        }, timeout=10, headers={"User-Agent": UA})
+        data = r.json()
+        if not data or len(data) < 2:
+            return CheckResult("domain_age_wayback", "authority", INFO,
+                               f"no Wayback snapshots for {domain}")
+        header, row = data[0], data[1]
+        ts_idx = header.index("timestamp") if "timestamp" in header else 1
+        ts = row[ts_idx]
+        year, month, day = int(ts[:4]), int(ts[4:6]), int(ts[6:8])
+        first_date = datetime(year, month, day, tzinfo=timezone.utc)
+        age_days = (datetime.now(timezone.utc) - first_date).days
+        age_years = age_days / 365.25
+        label = f"first archived {first_date:%Y-%m-%d}"
+        if age_days < 180:
+            return CheckResult("domain_age_wayback", "authority", WARN,
+                               f"{label} ({age_days}d ago) — new/unknown domain")
+        return CheckResult("domain_age_wayback", "authority", INFO,
+                           f"{label} (~{age_years:.1f} years)")
+    except Exception as e:
+        return CheckResult("domain_age_wayback", "authority", INFO,
+                           f"Wayback lookup failed: {type(e).__name__}")
+
+
+def check_wayback_snapshot_count(s: Site) -> CheckResult:
+    host = urlparse(s.final_url).hostname or ""
+    domain = _registered_domain(host)
+    try:
+        r = s.session.get(WAYBACK_CDX_URL, params={
+            "url": domain, "output": "json",
+            "collapse": "timestamp:8", "limit": 2000,
+        }, timeout=15, headers={"User-Agent": UA})
+        data = r.json()
+        if len(data) < 2:
+            return CheckResult("wayback_snapshot_count", "authority", INFO,
+                               f"0 archived days for {domain}")
+        rows = data[1:]
+        first_ts = rows[0][1]
+        last_ts = rows[-1][1]
+        return CheckResult("wayback_snapshot_count", "authority", INFO,
+                           f"{len(rows)} archived day(s), "
+                           f"{first_ts[:4]}-{first_ts[4:6]}..{last_ts[:4]}-{last_ts[4:6]}")
+    except Exception as e:
+        return CheckResult("wayback_snapshot_count", "authority", INFO,
+                           f"Wayback count failed: {type(e).__name__}")
+
+
+def check_wikipedia_presence(s: Site) -> CheckResult:
+    host = urlparse(s.final_url).hostname or ""
+    domain = _registered_domain(host)
+    short = domain.split(".")[0]
+    results: list[str] = []
+    for lang in ("en", "da"):
+        try:
+            r = s.session.get(f"https://{lang}.wikipedia.org/w/api.php",
+                              params={"action": "query", "list": "search",
+                                      "srsearch": short, "format": "json", "srlimit": 3},
+                              timeout=10, headers={"User-Agent": UA})
+            data = r.json()
+            for h in data.get("query", {}).get("search", []):
+                title = h.get("title", "")
+                snippet = h.get("snippet", "")
+                # match if title or snippet contains the root label or full domain
+                combined = f"{title} {snippet}".lower()
+                if short.lower() in combined or domain.lower() in combined:
+                    results.append(f"{lang}:{title}")
+                    break
+        except Exception:
+            continue
+    if results:
+        return CheckResult("wikipedia_presence", "authority", PASS,
+                           f"Wikipedia article: {', '.join(results)}")
+    return CheckResult("wikipedia_presence", "authority", INFO,
+                       "no Wikipedia article found")
+
+
+def check_commoncrawl_presence(s: Site) -> CheckResult:
+    host = urlparse(s.final_url).hostname or ""
+    domain = _registered_domain(host)
+    try:
+        info = s.session.get("https://index.commoncrawl.org/collinfo.json",
+                             timeout=10, headers={"User-Agent": UA})
+        crawls = info.json()
+        if not crawls:
+            return CheckResult("commoncrawl_presence", "authority", INFO,
+                               "no crawls available")
+        latest = crawls[0]
+        cdx = latest.get("cdx-api")
+        name = latest.get("name", "?")
+        if not cdx:
+            return CheckResult("commoncrawl_presence", "authority", INFO,
+                               f"no CDX API on {name}")
+        r = s.session.get(cdx, params={
+            "url": f"{domain}/*", "output": "json", "limit": 500,
+        }, timeout=15, headers={"User-Agent": UA})
+        lines = [l for l in r.text.splitlines() if l.strip()]
+        count = len(lines)
+        if count == 0:
+            return CheckResult("commoncrawl_presence", "authority", INFO,
+                               f"not in {name}")
+        suffix = "+ pages" if count >= 500 else " pages"
+        return CheckResult("commoncrawl_presence", "authority", INFO,
+                           f"{count}{suffix} in {name}")
+    except Exception as e:
+        return CheckResult("commoncrawl_presence", "authority", INFO,
+                           f"CC lookup failed: {type(e).__name__}")
+
+
+KNOWN_HOSTERS = {
+    "Cloudflare": ["cloudflare.com", "cloudflare.net"],
+    "AWS": ["amazonaws.com"],
+    "Google Cloud": ["googleusercontent.com", "googleapis.com", "1e100.net"],
+    "Azure": ["azurewebsites.net", "cloudapp.net", "azureedge.net"],
+    "Hetzner": ["hetzner.com", "your-server.de", "static.hetzner.com"],
+    "DigitalOcean": ["digitalocean.com"],
+    "Fastly": ["fastly.net", "fastlylb.net"],
+    "Netlify": ["netlify.com", "netlify.app"],
+    "Vercel": ["vercel.com", "vercel-dns.com"],
+    "Heroku": ["herokudns.com", "herokuapp.com"],
+    "GitHub Pages": ["github.io"],
+    "Akamai": ["akamai.net", "akamaiedge.net"],
+}
+
+
+def check_dns_popularity_signals(s: Site) -> CheckResult:
+    host = urlparse(s.final_url).hostname or ""
+    signals: list[str] = []
+    # reverse-DNS of first A record
+    try:
+        infos = socket.getaddrinfo(host, 443, family=socket.AF_INET,
+                                   type=socket.SOCK_STREAM)
+        if infos:
+            ip = infos[0][4][0]
+            try:
+                rdns = socket.gethostbyaddr(ip)[0]
+                hoster = None
+                for hname, domains in KNOWN_HOSTERS.items():
+                    if any(d in rdns.lower() for d in domains):
+                        hoster = hname
+                        break
+                signals.append(f"host: {hoster} ({rdns})" if hoster else f"rDNS: {rdns}")
+            except (socket.herror, OSError):
+                signals.append(f"A={ip} (no PTR)")
+    except (socket.gaierror, OSError):
+        pass
+    # MX presence
+    try:
+        import dns.resolver
+        resolver = dns.resolver.Resolver()
+        resolver.timeout = resolver.lifetime = 4.0
+        answer = resolver.resolve(_registered_domain(host), "MX",
+                                  raise_on_no_answer=False)
+        if answer.rrset is not None and len(answer):
+            signals.append(f"{len(list(answer))} MX")
+    except Exception:
+        pass
+    if not signals:
+        return CheckResult("dns_popularity_signals", "authority", INFO, "no signals gathered")
+    return CheckResult("dns_popularity_signals", "authority", INFO, "; ".join(signals))
+
+
+# ---------- Browser-based Meta / Google ad-library scrapes (behind --ads-deep) ----------
+
+def _find_facebook_page(s: Site) -> Optional[str]:
+    for a in s.soup.find_all("a", href=True):
+        href = a["href"]
+        m = re.search(r"https?://(?:www\.)?facebook\.com/([^/?#]+)", href)
+        if m:
+            slug = m.group(1)
+            if slug.lower() not in ("sharer", "share", "tr", "pages", "plugins", "dialog"):
+                return slug
+    return None
+
+
+def check_meta_ad_library(s: Site) -> CheckResult:
+    if not s.ads_deep:
+        return CheckResult("meta_ad_library", "ads", INFO,
+                           "skipped (pass --ads-deep to scrape Meta Ad Library)")
+    pool = s.browser_pool_ref
+    if pool is None or pool.context is None:
+        return CheckResult("meta_ad_library", "ads", INFO,
+                           "--ads-deep needs --browser (Chromium unavailable)")
+    host = urlparse(s.final_url).hostname or ""
+    domain = _registered_domain(host)
+    query = _find_facebook_page(s) or domain.split(".")[0]
+    url = ("https://www.facebook.com/ads/library/"
+           "?active_status=active&ad_type=all&country=ALL"
+           f"&q={quote(query, safe='')}&search_type=keyword_unordered")
+    with pool._lock:
+        page = pool.context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)  # let Facebook's JS settle
+            content = page.content()
+        except Exception as e:
+            page.close()
+            return CheckResult("meta_ad_library", "ads", INFO,
+                               f"scrape failed: {type(e).__name__}")
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+    m = re.search(r"~?(\d{1,3}(?:[,.]\d{3})*)\s*(?:result|ads?\b)", content, re.I)
+    if m:
+        return CheckResult("meta_ad_library", "ads", PASS,
+                           f"~{m.group(1)} active Meta ad(s) for '{query}'")
+    if re.search(r"no results|not running ads|0 results", content, re.I):
+        return CheckResult("meta_ad_library", "ads", INFO,
+                           f"no active Meta ads for '{query}'")
+    return CheckResult("meta_ad_library", "ads", INFO,
+                       f"Meta Ad Library inconclusive for '{query}' "
+                       "(scrape is best-effort; JS rendering may vary)")
+
+
+def check_google_ads_transparency(s: Site) -> CheckResult:
+    if not s.ads_deep:
+        return CheckResult("google_ads_transparency", "ads", INFO,
+                           "skipped (pass --ads-deep to scrape Google Ads Transparency)")
+    pool = s.browser_pool_ref
+    if pool is None or pool.context is None:
+        return CheckResult("google_ads_transparency", "ads", INFO,
+                           "--ads-deep needs --browser")
+    host = urlparse(s.final_url).hostname or ""
+    domain = _registered_domain(host)
+    query = domain.split(".")[0]
+    url = f"https://adstransparency.google.com/?region=anywhere&q={quote(query, safe='')}"
+    with pool._lock:
+        page = pool.context.new_page()
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            page.wait_for_timeout(3000)
+            content = page.content()
+        except Exception as e:
+            page.close()
+            return CheckResult("google_ads_transparency", "ads", INFO,
+                               f"scrape failed: {type(e).__name__}")
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
+    m = re.search(r"(\d{1,3}(?:,\d{3})*)\s*(?:ads?\b|advertisers)", content, re.I)
+    if m:
+        return CheckResult("google_ads_transparency", "ads", PASS,
+                           f"~{m.group(1)} active Google ads/advertisers for '{query}'")
+    if re.search(r"no (?:ads|advertisers)\s+(?:found|match)", content, re.I):
+        return CheckResult("google_ads_transparency", "ads", INFO,
+                           f"no Google ads for '{query}'")
+    return CheckResult("google_ads_transparency", "ads", INFO,
+                       f"Google Ads Transparency inconclusive for '{query}' "
+                       "(scrape is best-effort)")
+
+
 CHECKS: list[CheckFn] = [
     # shared
     check_https_reachable, check_url_status, check_url_not_redirected, check_redirect_chain,
@@ -2800,11 +3252,23 @@ CHECKS: list[CheckFn] = [
     check_browser_js_errors, check_browser_console_errors,
     check_browser_failed_requests, check_browser_load_time,
     check_browser_fcp, check_browser_lcp, check_browser_cls,
+    # ads pixels (HTML scan) + aggregated summary + deep scrapes
+    *_ADS_PIXEL_CHECKS, check_ads_pixels_summary,
+    check_meta_ad_library, check_google_ads_transparency,
+    # tracking / analytics
+    *_TRACKING_CHECKS, check_tracking_summary,
+    # martech (CMPs, chat widgets, CRM scripts, CDPs)
+    *_MARTECH_CHECKS, check_martech_summary,
+    # authority / rank signals (free, no API keys)
+    check_domain_age_wayback, check_wayback_snapshot_count,
+    check_wikipedia_presence, check_commoncrawl_presence,
+    check_dns_popularity_signals,
 ]
 
 
 def build_site(url: str, session: Optional[requests.Session] = None,
-               browser_pool: Optional[BrowserPool] = None) -> Site:
+               browser_pool: Optional[BrowserPool] = None,
+               ads_deep: bool = False) -> Site:
     """Build a Site for one URL. TLS probe and robots.txt are cached per host.
 
     Pass `session` to reuse a requests.Session (keep-alive) across many URLs.
@@ -2846,7 +3310,8 @@ def build_site(url: str, session: Optional[requests.Session] = None,
     return Site(url=url, final_url=r.url, response=r, soup=soup,
                 robots_text=robots, robots_content_type=robots_ct,
                 robots_status=robots_status, robots_url=robots_url, session=session,
-                tls_info=tls_info, browser_result=browser_result)
+                tls_info=tls_info, browser_result=browser_result,
+                ads_deep=ads_deep, browser_pool_ref=browser_pool)
 
 
 # Checks whose result doesn't change per URL on the same host — run once.
@@ -2860,6 +3325,15 @@ SITE_WIDE_CHECKS = {
     "caa_record", "dnssec",
     "llms_txt", "llms_full_txt", "ai_crawlers",
     "mx_records", "spf_record", "dmarc_record", "dkim_record", "mta_sts",
+    # ads/tracking/martech pixels are the same signatures for every page
+    "ads_pixels_summary", "tracking_summary", "martech_summary",
+    "meta_ad_library", "google_ads_transparency",
+    *(sig["name"] for sig in ADS_PIXEL_SIGNATURES),
+    *(sig["name"] for sig in TRACKING_SIGNATURES),
+    *(sig["name"] for sig in MARTECH_SIGNATURES),
+    # authority / rank signals are domain-level
+    "domain_age_wayback", "wayback_snapshot_count", "wikipedia_presence",
+    "commoncrawl_presence", "dns_popularity_signals",
 }
 
 
@@ -2927,7 +3401,8 @@ class ProgressBar:
 
 def _sort_results(results: list[CheckResult]) -> list[CheckResult]:
     order = {"shared": 0, "security": 1, "seo": 2, "llm": 3, "perf": 4,
-             "browser": 5, "a11y": 6, "privacy": 7, "email": 8}
+             "browser": 5, "a11y": 6, "privacy": 7, "email": 8,
+             "ads": 9, "tracking": 10, "martech": 11, "authority": 12}
     return sorted(results, key=lambda r: (order.get(r.category, 9), r.check))
 
 
@@ -2936,7 +3411,8 @@ def _check_name(fn: Callable) -> str:
 
 
 def run_site_audit(url: str, progress: bool = True, browser: bool = True,
-                   single: bool = False, max_urls: int = 50
+                   single: bool = False, max_urls: int = 50,
+                   ads_deep: bool = False
                    ) -> tuple[list[CheckResult], dict[str, list[CheckResult]], list[str]]:
     """Audit a site: one pass of site-wide checks + per-URL checks over discovered URLs.
 
@@ -2945,7 +3421,7 @@ def run_site_audit(url: str, progress: bool = True, browser: bool = True,
     session = requests.Session()
 
     # homepage = first URL we audit + source of discovery
-    homepage = build_site(url, session=session)
+    homepage = build_site(url, session=session, ads_deep=ads_deep)
 
     # discover URLs
     if single:
@@ -2961,6 +3437,9 @@ def run_site_audit(url: str, progress: bool = True, browser: bool = True,
         browser_error = pool.start()
         if browser_error:
             pool = None
+    # Now that we know if the pool exists, attach it to the homepage so the
+    # site-wide ads-library checks can use it.
+    homepage.browser_pool_ref = pool
 
     # total ticks for progress bar
     #   site-wide checks: len(SITE_WIDE_CHECKS intersecting CHECKS)
@@ -3008,7 +3487,8 @@ def run_site_audit(url: str, progress: bool = True, browser: bool = True,
         else:
             try:
                 # each thread needs its own Session to avoid urllib3 contention
-                site = build_site(u, session=requests.Session(), browser_pool=pool)
+                site = build_site(u, session=requests.Session(), browser_pool=pool,
+                                  ads_deep=ads_deep)
             except requests.RequestException as e:
                 return u, [CheckResult("fetch_failed", "shared", FAIL, str(e))]
         res = _run_checks_sequential(site, active_per_url)
@@ -3049,7 +3529,11 @@ CATEGORIES = [("shared", "Shared / Transport"), ("security", "Security / TLS / D
               ("seo", "SEO"), ("llm", "LLM-readiness"),
               ("perf", "Performance"), ("browser", "Runtime (headless browser)"),
               ("a11y", "Accessibility"), ("privacy", "Privacy"),
-              ("email", "Email / DNS")]
+              ("email", "Email / DNS"),
+              ("ads", "Ads pixels & ad libraries"),
+              ("tracking", "Analytics / tracking"),
+              ("martech", "Marketing stack (CMPs, chat, CRM)"),
+              ("authority", "Authority signals (free, no API keys)")]
 
 
 def _render_table(results: list[CheckResult]) -> list[str]:
@@ -3180,6 +3664,9 @@ def main(argv: list[str]) -> int:
                     help="audit only the input URL (skip sitemap/link crawl)")
     ap.add_argument("--max-urls", type=int, default=50,
                     help="max URLs to audit when crawling (default 50)")
+    ap.add_argument("--ads-deep", action="store_true",
+                    help="scrape Meta Ad Library + Google Ads Transparency Center "
+                         "for active-ad counts (best-effort; requires --browser)")
     args = ap.parse_args(argv)
 
     url = args.url
@@ -3193,6 +3680,7 @@ def main(argv: list[str]) -> int:
             browser=not args.no_browser,
             single=args.single,
             max_urls=args.max_urls,
+            ads_deep=args.ads_deep,
         )
     except requests.RequestException as e:
         print(f"fatal: could not fetch {url}: {e}", file=sys.stderr)

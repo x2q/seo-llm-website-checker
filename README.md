@@ -1,6 +1,8 @@
 # seo-llm-website-checker
 
-One command, one URL → full-site audit of **93 checks** across SEO, security, performance, accessibility, privacy, email DNS, and LLM-readiness. Crawls up to 50 URLs via `sitemap.xml` (or homepage link fallback), runs site-wide checks once, per-URL checks for each page, outputs markdown or JSON.
+One command, one URL → full-site audit of **~140 checks** across SEO, security, performance, accessibility, privacy, email DNS, LLM-readiness, ad-pixel / tracking / martech detection, and free authority signals. Crawls up to 50 URLs via `sitemap.xml` (or homepage link fallback), runs site-wide checks once, per-URL checks for each page, outputs markdown or JSON.
+
+**No API keys. Ever.** Every data source is publicly accessible without registration — Wayback CDX, Wikipedia API, Common Crawl index, DNS, and direct scraping of public ad-transparency pages.
 
 Built on `requests`, `beautifulsoup4`, `dnspython`, stdlib `ssl`/`socket`, and (optionally) Playwright Chromium for runtime checks like LCP, CLS, JS errors.
 
@@ -61,6 +63,7 @@ Live progress bar on stderr while running (auto-hides for pipes/CI):
 | `--single` | audit only the input URL (no crawl) |
 | `--max-urls N` | cap the crawl (default 50) |
 | `--no-browser` | skip headless-Chromium checks (saves ~3s per URL) |
+| `--ads-deep` | scrape Meta Ad Library + Google Ads Transparency (needs `--browser`) |
 | `--no-progress` | silence the stderr bar |
 | `--json` | emit `{url, urls_audited, site_wide, per_url}` instead of markdown |
 | `--fail-on warn\|fail` | exit 1 on any 🟡 or 🔴 (for CI) |
@@ -69,13 +72,18 @@ Live progress bar on stderr while running (auto-hides for pipes/CI):
 
 Checks are partitioned into **site-wide** (run once on the homepage — results apply to the whole host) and **per-URL** (run for every crawled page).
 
-### Site-wide (22)
+### Site-wide (22 + 10 ads + 13 tracking + 17 martech + 5 authority + 2 ad libraries = 69)
 
 **Transport:** `http_to_https_redirect`, `www_apex_canonicalization`, `hsts_header`, `dual_stack_host`, `robots_txt`
 **TLS / DNS:** `tls_cert_expiry`, `tls_cert_hostname_match`, `tls_protocol_version`, `tls_chain_completeness`, `hsts_preload_ready`, `caa_record`, `dnssec`
 **Sitemap:** `sitemap_xml`, `sitemap_urls_reachable`
 **LLM-readiness:** `llms_txt`, `llms_full_txt`, `ai_crawlers_allowed`
 **Email DNS:** `mx_records`, `spf_record`, `dmarc_record`, `dkim_record`, `mta_sts`
+**Ads pixels** (HTML signature scan, extracts pixel ID when present): `meta_pixel`, `google_ads`, `google_tag_manager`, `linkedin_insight`, `tiktok_pixel`, `pinterest_tag`, `snapchat_pixel`, `reddit_pixel`, `bing_uet`, `x_twitter_pixel`, plus aggregated `ads_pixels_summary`
+**Ads libraries** (opt-in via `--ads-deep`, needs `--browser`): `meta_ad_library`, `google_ads_transparency`
+**Analytics / tracking:** `google_analytics_4`, `universal_analytics` (WARN — sunset July 2024), `segment`, `mixpanel`, `hotjar`, `microsoft_clarity`, `plausible`, `fathom`, `simple_analytics`, `cloudflare_analytics`, `matomo`, `amplitude`, `fullstory`, plus aggregated `tracking_summary`
+**Martech** (CMPs, chat, CRM, CDPs): `cookiebot`, `onetrust`, `usercentrics`, `didomi`, `iubenda`, `intercom`, `drift`, `zendesk_chat`, `crisp`, `tawk`, `hubspot_chat`, `marketo`, `pardot`, `activecampaign`, `klaviyo`, `rudderstack`, `mparticle`, plus aggregated `martech_summary`
+**Authority signals** (free, no API keys): `domain_age_wayback`, `wayback_snapshot_count`, `wikipedia_presence`, `commoncrawl_presence`, `dns_popularity_signals`
 
 ### Per-URL (71)
 
@@ -102,6 +110,36 @@ Checks are partitioned into **site-wide** (run once on the homepage — results 
 #### Privacy (1)
 
 `cookie_flags`
+
+### Ads, tracking, martech — how they work
+
+Each platform is a module-level signature dict with:
+- `patterns`: any-of regex list (case-insensitive match against the HTML)
+- `id_regex`: case-sensitive extraction of the pixel/tag ID when present
+
+Adding a new platform is a 3-line edit: append a dict to the right `*_SIGNATURES` list in `check.py`.
+
+A check returns `PASS` when the signature matches (with the ID in the message when extractable), `INFO` when not detected. `universal_analytics` uniquely returns `WARN` on match because GA legacy was sunset July 2024.
+
+### Ads libraries — `--ads-deep`
+
+Scrapes two public, auth-free pages:
+- **Meta Ad Library** (`facebook.com/ads/library`) — searches for the site's FB page (discovered via `facebook.com/<name>` links on the page) or the domain root label
+- **Google Ads Transparency** (`adstransparency.google.com`) — searches by domain root label
+
+Both are **best-effort** — Meta and Google ship heavy JS rendering and change DOM structure regularly. These checks fail gracefully to `INFO` with an explanation when scraping can't extract an active-ad count. Use for a quick signal, not a source of truth.
+
+### Authority signals — no API keys
+
+| Check | Source | Auth? |
+|---|---|---|
+| `domain_age_wayback` | Wayback CDX API (`web.archive.org/cdx/search/cdx`) | none |
+| `wayback_snapshot_count` | same, with `collapse=timestamp:8` for unique days | none |
+| `wikipedia_presence` | MediaWiki action API (en + da) | none |
+| `commoncrawl_presence` | Common Crawl CDX on the latest crawl (`collinfo.json` + per-crawl `cdx-api`) | none |
+| `dns_popularity_signals` | stdlib `socket.gethostbyaddr` for reverse DNS + MX lookup; matches against known hoster domains (Cloudflare, AWS, GCP, Azure, Hetzner, Fastly, Netlify, Vercel, Heroku, GitHub Pages, Akamai, DigitalOcean) | none |
+
+Every authority check has a short timeout (≤15 s) and returns `INFO` on any failure — no site audit is ever blocked by these external services.
 
 ### Notable rules
 
