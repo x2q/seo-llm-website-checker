@@ -232,6 +232,18 @@ def check_dual_stack_assets(s: Site) -> CheckResult:
 # ---------- Security: TLS / cert / DNS-security / HTTP headers ----------
 
 
+# host-level caches so multi-URL runs don't repeat expensive probes
+_TLS_CACHE: dict[str, dict] = {}
+_ROBOTS_CACHE: dict[str, tuple[Optional[str], Optional[str], Optional[int], str]] = {}
+
+
+def _tls_probe_cached(host: str, port: int = 443) -> dict:
+    key = f"{host}:{port}"
+    if key not in _TLS_CACHE:
+        _TLS_CACHE[key] = _tls_probe(host, port)
+    return _TLS_CACHE[key]
+
+
 def _tls_probe(host: str, port: int = 443, timeout: float = 6.0) -> dict:
     """Establish a TLS connection and return cert + version + alpn + chain info."""
     ctx = ssl.create_default_context()
@@ -696,71 +708,73 @@ def check_compression(s: Site) -> CheckResult:
 # ---------- Headless-browser runtime checks (--browser) ----------
 
 
-def run_browser_audit(url: str, timeout_ms: int = 30000) -> dict:
-    """Load the page in headless Chromium and collect runtime observations.
+_BROWSER_INIT_SCRIPT = """
+    window.__webvitals = { lcp: 0, cls: 0 };
+    new PerformanceObserver((list) => {
+        const entries = list.getEntries();
+        const last = entries[entries.length - 1];
+        if (last) window.__webvitals.lcp = last.startTime;
+    }).observe({ type: 'largest-contentful-paint', buffered: true });
+    new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+            if (!e.hadRecentInput) window.__webvitals.cls += e.value;
+        }
+    }).observe({ type: 'layout-shift', buffered: true });
+"""
 
-    Returns a dict with: console_errors, console_warnings, page_errors,
-    failed_requests, load_time_ms, dom_content_loaded_ms, fcp_ms, lcp_ms, cls.
-    Empty dict with 'error' key on failure.
-    """
-    try:
-        from playwright.sync_api import sync_playwright
-    except ImportError:
-        return {"error": "playwright not installed — run: pip install -r requirements-browser.txt && playwright install chromium"}
 
-    console_errors: list[dict] = []
-    console_warnings: list[dict] = []
-    page_errors: list[str] = []
-    failed_requests: list[dict] = []
+class BrowserPool:
+    """One Playwright/Chromium instance reused across many URL navigations."""
 
-    try:
-        with sync_playwright() as p:
-            try:
-                browser = p.chromium.launch(headless=True)
-            except Exception as e:
-                return {"error": f"could not launch chromium — run: playwright install chromium ({e})"}
-            context = browser.new_context(
+    def __init__(self) -> None:
+        self.pw = None
+        self.browser = None
+        self.context = None
+        self.error: Optional[str] = None
+
+    def start(self) -> Optional[str]:
+        try:
+            from playwright.sync_api import sync_playwright
+        except ImportError:
+            self.error = ("playwright not installed — run: pip install -r "
+                          "requirements-browser.txt && playwright install chromium")
+            return self.error
+        try:
+            self.pw = sync_playwright().start()
+            self.browser = self.pw.chromium.launch(headless=True)
+            self.context = self.browser.new_context(
                 user_agent=DESKTOP_UA,
                 viewport={"width": 1350, "height": 940},
             )
-            page = context.new_page()
+            self.context.add_init_script(_BROWSER_INIT_SCRIPT)
+        except Exception as e:
+            self.error = f"could not launch chromium — run: playwright install chromium ({e})"
+            self.stop()
+            return self.error
+        return None
 
-            page.on("console", lambda msg: (
-                console_errors if msg.type == "error" else console_warnings
-            ).append({"text": msg.text[:200], "location": str(msg.location)})
-                if msg.type in ("error", "warning") else None)
-            page.on("pageerror", lambda err: page_errors.append(str(err)[:300]))
-            page.on("requestfailed", lambda req: failed_requests.append({
-                "url": req.url[:200],
-                "failure": (req.failure or "unknown")[:100],
-                "method": req.method,
-            }))
+    def audit(self, url: str, timeout_ms: int = 30000) -> dict:
+        if self.error or not self.context:
+            return {"error": self.error or "browser pool not started"}
+        console_errors: list[dict] = []
+        console_warnings: list[dict] = []
+        page_errors: list[str] = []
+        failed_requests: list[dict] = []
 
-            # install LCP + CLS observers BEFORE navigation
-            init_script = """
-                window.__webvitals = { lcp: 0, cls: 0 };
-                new PerformanceObserver((list) => {
-                    const entries = list.getEntries();
-                    const last = entries[entries.length - 1];
-                    if (last) window.__webvitals.lcp = last.startTime;
-                }).observe({ type: 'largest-contentful-paint', buffered: true });
-                new PerformanceObserver((list) => {
-                    for (const e of list.getEntries()) {
-                        if (!e.hadRecentInput) window.__webvitals.cls += e.value;
-                    }
-                }).observe({ type: 'layout-shift', buffered: true });
-            """
-            context.add_init_script(init_script)
-
-            try:
-                response = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-            except Exception as e:
-                browser.close()
-                return {"error": f"navigation failed: {e}"}
-
-            # allow a moment for observers to settle
+        page = self.context.new_page()
+        page.on("console", lambda msg: (
+            console_errors if msg.type == "error" else console_warnings
+        ).append({"text": msg.text[:200], "location": str(msg.location)})
+            if msg.type in ("error", "warning") else None)
+        page.on("pageerror", lambda err: page_errors.append(str(err)[:300]))
+        page.on("requestfailed", lambda req: failed_requests.append({
+            "url": req.url[:200],
+            "failure": (req.failure or "unknown")[:100],
+            "method": req.method,
+        }))
+        try:
+            response = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
             page.wait_for_timeout(500)
-
             metrics = page.evaluate("""() => {
                 const nav = performance.getEntriesByType('navigation')[0] || {};
                 const paint = performance.getEntriesByType('paint');
@@ -773,24 +787,55 @@ def run_browser_audit(url: str, timeout_ms: int = 30000) -> dict:
                     cls: (window.__webvitals && window.__webvitals.cls) || 0,
                 };
             }""")
-
             status = response.status if response else None
-            browser.close()
-    except Exception as e:
-        return {"error": f"playwright error: {e}"}
+        except Exception as e:
+            page.close()
+            return {"error": f"navigation failed: {e}"}
+        finally:
+            try:
+                page.close()
+            except Exception:
+                pass
 
-    return {
-        "status": status,
-        "console_errors": console_errors,
-        "console_warnings": console_warnings,
-        "page_errors": page_errors,
-        "failed_requests": failed_requests,
-        "dom_content_loaded_ms": int(metrics.get("domContentLoaded") or 0),
-        "load_complete_ms": int(metrics.get("loadComplete") or 0),
-        "fcp_ms": int(metrics.get("fcp") or 0),
-        "lcp_ms": int(metrics.get("lcp") or 0),
-        "cls": float(metrics.get("cls") or 0),
-    }
+        return {
+            "status": status,
+            "console_errors": console_errors,
+            "console_warnings": console_warnings,
+            "page_errors": page_errors,
+            "failed_requests": failed_requests,
+            "dom_content_loaded_ms": int(metrics.get("domContentLoaded") or 0),
+            "load_complete_ms": int(metrics.get("loadComplete") or 0),
+            "fcp_ms": int(metrics.get("fcp") or 0),
+            "lcp_ms": int(metrics.get("lcp") or 0),
+            "cls": float(metrics.get("cls") or 0),
+        }
+
+    def stop(self) -> None:
+        try:
+            if self.browser:
+                self.browser.close()
+        except Exception:
+            pass
+        try:
+            if self.pw:
+                self.pw.stop()
+        except Exception:
+            pass
+        self.browser = None
+        self.pw = None
+        self.context = None
+
+
+# kept for backwards compat
+def run_browser_audit(url: str, timeout_ms: int = 30000) -> dict:
+    pool = BrowserPool()
+    err = pool.start()
+    if err:
+        return {"error": err}
+    try:
+        return pool.audit(url, timeout_ms)
+    finally:
+        pool.stop()
 
 
 def _br(s: Site) -> Optional[dict]:
@@ -2745,33 +2790,92 @@ CHECKS: list[CheckFn] = [
 ]
 
 
-def build_site(url: str, browser: bool = False) -> Site:
-    session = requests.Session()
+def build_site(url: str, session: Optional[requests.Session] = None,
+               browser_pool: Optional[BrowserPool] = None) -> Site:
+    """Build a Site for one URL. TLS probe and robots.txt are cached per host.
+
+    Pass `session` to reuse a requests.Session (keep-alive) across many URLs.
+    Pass `browser_pool` to run a headless-browser audit for this URL.
+    """
+    if session is None:
+        session = requests.Session()
     r = fetch(session, url)
     soup = BeautifulSoup(r.text, "html.parser")
-    robots_url = urljoin(root_url(r.url), "/robots.txt")
-    robots, robots_ct, robots_status = None, None, None
-    try:
-        rr = fetch(session, robots_url)
-        robots_status = rr.status_code
-        robots_ct = rr.headers.get("Content-Type")
-        if rr.status_code == 200:
-            robots = rr.text
-    except requests.RequestException:
-        pass
-    # one TLS probe, reused by every security check
+    host = urlparse(r.url).hostname or ""
+    # host-cached robots.txt
+    if host in _ROBOTS_CACHE:
+        robots, robots_ct, robots_status, robots_url = _ROBOTS_CACHE[host]
+    else:
+        robots_url = urljoin(root_url(r.url), "/robots.txt")
+        robots, robots_ct, robots_status = None, None, None
+        try:
+            rr = fetch(session, robots_url)
+            robots_status = rr.status_code
+            robots_ct = rr.headers.get("Content-Type")
+            if rr.status_code == 200:
+                robots = rr.text
+        except requests.RequestException:
+            pass
+        _ROBOTS_CACHE[host] = (robots, robots_ct, robots_status, robots_url)
+    # host-cached TLS probe
     tls_info: Optional[dict] = None
     parsed = urlparse(r.url)
     if parsed.scheme == "https" and parsed.hostname:
-        tls_info = _tls_probe(parsed.hostname, parsed.port or 443)
-    # optional headless-browser audit (one navigation, reused by every browser check)
+        tls_info = _tls_probe_cached(parsed.hostname, parsed.port or 443)
+    # optional headless-browser audit (one navigation per URL)
     browser_result: Optional[dict] = None
-    if browser:
-        browser_result = run_browser_audit(r.url)
+    if browser_pool is not None:
+        browser_result = browser_pool.audit(r.url)
     return Site(url=url, final_url=r.url, response=r, soup=soup,
                 robots_text=robots, robots_content_type=robots_ct,
                 robots_status=robots_status, robots_url=robots_url, session=session,
                 tls_info=tls_info, browser_result=browser_result)
+
+
+# Checks whose result doesn't change per URL on the same host — run once.
+# Names match `check_<name>` function stripped of the `check_` prefix.
+SITE_WIDE_CHECKS = {
+    "http_to_https", "www_apex", "hsts", "hsts_preload_ready",
+    "dual_stack_host",
+    "robots_txt",
+    "tls_cert_expiry", "tls_cert_hostname", "tls_protocol_version",
+    "tls_chain_completeness",
+    "caa_record", "dnssec",
+    "llms_txt", "llms_full_txt", "ai_crawlers",
+    "mx_records", "spf_record", "dmarc_record", "dkim_record", "mta_sts",
+}
+
+
+def _discover_urls(site: Site, max_urls: int) -> list[str]:
+    """Find URLs to audit. Prefer sitemap; fall back to internal links on homepage."""
+    # 1. sitemap
+    sm_result, locs = check_sitemap(site)
+    if locs:
+        # dedupe + cap; include homepage up front if not present
+        seen: set[str] = set()
+        out: list[str] = []
+        for u in [site.final_url, *locs]:
+            if u not in seen:
+                seen.add(u)
+                out.append(u)
+            if len(out) >= max_urls:
+                break
+        return out
+    # 2. fallback: crawl <a href> from homepage
+    host = urlparse(site.final_url).hostname or ""
+    out = [site.final_url]
+    seen = {site.final_url}
+    for a in site.soup.find_all("a", href=True):
+        u = urljoin(site.final_url, a["href"].split("#")[0])
+        p = urlparse(u)
+        if p.hostname == host and p.scheme in ("http", "https"):
+            clean = urlunparse(p._replace(fragment=""))
+            if clean not in seen:
+                seen.add(clean)
+                out.append(clean)
+        if len(out) >= max_urls:
+            break
+    return out
 
 
 class ProgressBar:
@@ -2802,44 +2906,203 @@ class ProgressBar:
             sys.stderr.flush()
 
 
-def run_all(url: str, progress: bool = True, browser: bool = False) -> list[CheckResult]:
-    site = build_site(url, browser=browser)
-    # skip browser-only checks entirely when --browser is off (otherwise 7 INFO noise rows)
-    active_checks = [fn for fn in CHECKS
-                     if browser or not fn.__name__.startswith("check_browser_")]
-    bar = ProgressBar(total=len(active_checks) + 4, enabled=progress)
-    results: list[CheckResult] = []
-    for fn in active_checks:
-        r = fn(site)
-        results.append(r)
-        bar.tick(r)
-    sm_result, locs = check_sitemap(site)
-    results.append(sm_result)
-    bar.tick(sm_result)
-    su = check_sitemap_urls_reachable(site, locs)
-    results.append(su)
-    bar.tick(su)
-    link_results, _ = _probe_internal_links(site)
-    for r in link_results:
-        results.append(r)
-        bar.tick(r)
-    bar.close()
+def _sort_results(results: list[CheckResult]) -> list[CheckResult]:
     order = {"shared": 0, "security": 1, "seo": 2, "llm": 3, "perf": 4,
              "browser": 5, "a11y": 6, "privacy": 7, "email": 8}
-    results.sort(key=lambda r: (order.get(r.category, 9), r.check))
-    return results
+    return sorted(results, key=lambda r: (order.get(r.category, 9), r.check))
 
 
-def render_markdown(url: str, results: Iterable[CheckResult]) -> str:
-    results = list(results)
-    lines = [f"# SEO + LLM check: {url}\n"]
-    categories = [("shared", "Shared / Transport"), ("security", "Security / TLS / DNS"),
-                  ("seo", "SEO"), ("llm", "LLM-readiness"),
-                  ("perf", "Performance"), ("browser", "Runtime (headless browser)"),
-                  ("a11y", "Accessibility"), ("privacy", "Privacy"),
-                  ("email", "Email / DNS")]
-    for cat, label in categories:
+def _check_name(fn: Callable) -> str:
+    return fn.__name__.replace("check_", "", 1)
+
+
+def run_site_audit(url: str, progress: bool = True, browser: bool = True,
+                   single: bool = False, max_urls: int = 50
+                   ) -> tuple[list[CheckResult], dict[str, list[CheckResult]], list[str]]:
+    """Audit a site: one pass of site-wide checks + per-URL checks over discovered URLs.
+
+    Returns (site_wide_results, per_url_results, urls_audited).
+    """
+    session = requests.Session()
+
+    # homepage = first URL we audit + source of discovery
+    homepage = build_site(url, session=session)
+
+    # discover URLs
+    if single:
+        urls = [homepage.final_url]
+    else:
+        urls = _discover_urls(homepage, max_urls)
+
+    # optional browser pool, reused across navigations
+    pool: Optional[BrowserPool] = None
+    browser_error: Optional[str] = None
+    if browser:
+        pool = BrowserPool()
+        browser_error = pool.start()
+        if browser_error:
+            pool = None
+
+    # total ticks for progress bar
+    #   site-wide checks: len(SITE_WIDE_CHECKS intersecting CHECKS)
+    #   per-URL checks (len(CHECKS) - site-wide count - browser-off count) × len(urls)
+    active_per_url = [fn for fn in CHECKS
+                      if _check_name(fn) not in SITE_WIDE_CHECKS
+                      and (pool is not None or not fn.__name__.startswith("check_browser_"))]
+    site_wide_fns = [fn for fn in CHECKS if _check_name(fn) in SITE_WIDE_CHECKS]
+    total_ticks = len(site_wide_fns) + len(active_per_url) * len(urls) + 2 * len(urls)
+    bar = ProgressBar(total=total_ticks, enabled=progress)
+
+    # ── site-wide checks on homepage ──
+    site_wide_results: list[CheckResult] = []
+    for fn in site_wide_fns:
+        r = fn(homepage)
+        site_wide_results.append(r)
+        bar.tick(r)
+    # sitemap is site-wide (same for every page on the host)
+    sm_result, locs = check_sitemap(homepage)
+    site_wide_results.append(sm_result)
+    bar.tick(sm_result)
+    su = check_sitemap_urls_reachable(homepage, locs)
+    site_wide_results.append(su)
+    bar.tick(su)
+
+    # ── per-URL checks ──
+    per_url_results: dict[str, list[CheckResult]] = {}
+    for i, u in enumerate(urls):
+        # reuse homepage site for the first URL if it matches (save a fetch)
+        if u == homepage.final_url and i == 0:
+            site = homepage
+            if pool is not None:
+                site.browser_result = pool.audit(u)
+        else:
+            try:
+                site = build_site(u, session=session, browser_pool=pool)
+            except requests.RequestException as e:
+                per_url_results[u] = [CheckResult("fetch_failed", "shared", FAIL, str(e))]
+                continue
+
+        res: list[CheckResult] = []
+        for fn in active_per_url:
+            r = fn(site)
+            res.append(r)
+            bar.tick(r)
+        # internal-link probe is per-URL (each page has different links)
+        link_results, _ = _probe_internal_links(site)
+        for lr in link_results:
+            res.append(lr)
+        per_url_results[u] = _sort_results(res)
+
+    bar.close()
+    if pool is not None:
+        pool.stop()
+    if browser_error:
+        site_wide_results.append(CheckResult("browser_pool", "browser", FAIL, browser_error))
+
+    return _sort_results(site_wide_results), per_url_results, urls
+
+
+# back-compat shim for any external caller
+def run_all(url: str, progress: bool = True, browser: bool = False) -> list[CheckResult]:
+    site_wide, per_url, _ = run_site_audit(url, progress=progress, browser=browser, single=True)
+    first = next(iter(per_url.values())) if per_url else []
+    return _sort_results(site_wide + first)
+
+
+CATEGORIES = [("shared", "Shared / Transport"), ("security", "Security / TLS / DNS"),
+              ("seo", "SEO"), ("llm", "LLM-readiness"),
+              ("perf", "Performance"), ("browser", "Runtime (headless browser)"),
+              ("a11y", "Accessibility"), ("privacy", "Privacy"),
+              ("email", "Email / DNS")]
+
+
+def _render_table(results: list[CheckResult]) -> list[str]:
+    out: list[str] = []
+    for cat, label in CATEGORIES:
         rows = [r for r in results if r.category == cat]
+        if not rows:
+            continue
+        out.append(f"### {label}")
+        out.append("| Check | Status | Detail |")
+        out.append("|---|---|---|")
+        for r in rows:
+            detail = r.message.replace("|", "\\|")
+            out.append(f"| {r.check} | {ICON.get(r.status, '?')} {r.status} | {detail} |")
+        out.append("")
+    return out
+
+
+def _counts(results: list[CheckResult]) -> dict[str, int]:
+    return {s: sum(1 for r in results if r.status == s) for s in (PASS, WARN, FAIL, INFO)}
+
+
+def _summary_line(results: list[CheckResult]) -> str:
+    c = _counts(results)
+    return (f"{ICON[PASS]} {c[PASS]} pass · {ICON[WARN]} {c[WARN]} warn · "
+            f"{ICON[FAIL]} {c[FAIL]} fail · {ICON[INFO]} {c[INFO]} info")
+
+
+def render_markdown(url: str, site_wide: list[CheckResult],
+                    per_url: dict[str, list[CheckResult]], urls: list[str]) -> str:
+    lines: list[str] = [f"# Site audit: {url}", ""]
+    lines.append(f"Audited **{len(urls)}** URL(s).  ")
+    lines.append(f"Site-wide: **{_summary_line(site_wide)}**")
+    lines.append("")
+
+    # ── site-wide section ──
+    lines.append("## Site-wide checks")
+    lines.append("_Run once on the homepage; results apply to the whole host._")
+    lines.append("")
+    lines.extend(_render_table(site_wide))
+
+    # ── per-URL issue table ──
+    lines.append("## Per-URL issues (WARN + FAIL only)")
+    lines.append("| URL | Check | Status | Detail |")
+    lines.append("|---|---|---|---|")
+    any_issues = False
+    for u in urls:
+        rs = per_url.get(u, [])
+        for r in rs:
+            if r.status in (WARN, FAIL):
+                any_issues = True
+                detail = r.message.replace("|", "\\|")
+                short = u.replace(url.rstrip("/"), "") or "/"
+                lines.append(f"| {short} | {r.check} | {ICON[r.status]} {r.status} | {detail[:140]} |")
+    if not any_issues:
+        lines.append("| _(none)_ | | | |")
+    lines.append("")
+
+    # ── worst pages ──
+    by_page: list[tuple[str, dict[str, int]]] = [(u, _counts(per_url.get(u, []))) for u in urls]
+    worst = sorted(by_page, key=lambda x: (-x[1][FAIL], -x[1][WARN]))[:10]
+    lines.append("## Per-URL summary")
+    lines.append("| URL | ✅ | 🟡 | 🔴 | ℹ️ |")
+    lines.append("|---|---|---|---|---|")
+    for u, c in worst:
+        short = u.replace(url.rstrip("/"), "") or "/"
+        lines.append(f"| {short} | {c[PASS]} | {c[WARN]} | {c[FAIL]} | {c[INFO]} |")
+    if len(urls) > 10:
+        lines.append(f"| _… {len(urls) - 10} more URL(s) …_ | | | | |")
+    lines.append("")
+
+    # ── aggregate ──
+    all_results = list(site_wide)
+    for rs in per_url.values():
+        all_results.extend(rs)
+    lines.append(f"**Aggregate:** {_summary_line(all_results)} across "
+                 f"site-wide + {len(urls)} URL(s)")
+    return "\n".join(lines)
+
+
+def render_single(url: str, site_wide: list[CheckResult],
+                  per_url: dict[str, list[CheckResult]]) -> str:
+    """Compatible with --single: flatten site-wide + the one page into one report."""
+    lines = [f"# SEO + LLM check: {url}", ""]
+    one_page = next(iter(per_url.values())) if per_url else []
+    combined = _sort_results(site_wide + one_page)
+    # reuse existing single-page renderer style (## headers, not ### from table helper)
+    for cat, label in CATEGORIES:
+        rows = [r for r in combined if r.category == cat]
         if not rows:
             continue
         lines.append(f"## {label}")
@@ -2849,12 +3112,7 @@ def render_markdown(url: str, results: Iterable[CheckResult]) -> str:
             detail = r.message.replace("|", "\\|")
             lines.append(f"| {r.check} | {ICON.get(r.status, '?')} {r.status} | {detail} |")
         lines.append("")
-    summary = {s: sum(1 for r in results if r.status == s) for s in (PASS, WARN, FAIL, INFO)}
-    lines.append(f"**Summary:** "
-                 f"{ICON[PASS]} {summary[PASS]} pass · "
-                 f"{ICON[WARN]} {summary[WARN]} warn · "
-                 f"{ICON[FAIL]} {summary[FAIL]} fail · "
-                 f"{ICON[INFO]} {summary[INFO]} info")
+    lines.append(f"**Summary:** {_summary_line(combined)}")
     return "\n".join(lines)
 
 
@@ -2866,11 +3124,14 @@ def main(argv: list[str]) -> int:
                     help="exit non-zero if any check at or above this severity")
     ap.add_argument("--no-progress", action="store_true",
                     help="suppress the stderr progress bar")
-    ap.add_argument("--browser", action="store_true",
-                    help="run a headless Chromium audit (JS errors, LCP, CLS, FCP, "
-                         "load time, console errors, failed requests). "
-                         "Needs: pip install -r requirements-browser.txt "
-                         "&& playwright install chromium")
+    ap.add_argument("--no-browser", action="store_true",
+                    help="disable the headless-browser audit (it is ON by default; "
+                         "needs `pip install -r requirements-browser.txt && "
+                         "playwright install chromium` the first time)")
+    ap.add_argument("--single", action="store_true",
+                    help="audit only the input URL (skip sitemap/link crawl)")
+    ap.add_argument("--max-urls", type=int, default=50,
+                    help="max URLs to audit when crawling (default 50)")
     args = ap.parse_args(argv)
 
     url = args.url
@@ -2878,19 +3139,36 @@ def main(argv: list[str]) -> int:
         url = "https://" + url
 
     try:
-        results = run_all(url, progress=not args.no_progress, browser=args.browser)
+        site_wide, per_url, urls = run_site_audit(
+            url,
+            progress=not args.no_progress,
+            browser=not args.no_browser,
+            single=args.single,
+            max_urls=args.max_urls,
+        )
     except requests.RequestException as e:
         print(f"fatal: could not fetch {url}: {e}", file=sys.stderr)
         return 2
 
     if args.json:
-        print(json.dumps({"url": url, "results": [asdict(r) for r in results]}, indent=2))
+        out = {
+            "url": url,
+            "urls_audited": urls,
+            "site_wide": [asdict(r) for r in site_wide],
+            "per_url": {u: [asdict(r) for r in rs] for u, rs in per_url.items()},
+        }
+        print(json.dumps(out, indent=2))
+    elif args.single:
+        print(render_single(url, site_wide, per_url))
     else:
-        print(render_markdown(url, results))
+        print(render_markdown(url, site_wide, per_url, urls))
 
-    if args.fail_on == "fail" and any(r.status == FAIL for r in results):
+    all_results = list(site_wide)
+    for rs in per_url.values():
+        all_results.extend(rs)
+    if args.fail_on == "fail" and any(r.status == FAIL for r in all_results):
         return 1
-    if args.fail_on == "warn" and any(r.status in (WARN, FAIL) for r in results):
+    if args.fail_on == "warn" and any(r.status in (WARN, FAIL) for r in all_results):
         return 1
     return 0
 

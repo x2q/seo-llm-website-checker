@@ -1,34 +1,40 @@
 # seo-llm-website-checker
 
-A single-file Python CLI that audits one live URL against **86 static checks** (plus 7 optional runtime checks via headless Chromium) across SEO, performance, security, accessibility, privacy, email DNS, and LLM-readiness — in one command, in ~5 seconds (plus ~3 s if `--browser`).
+A single-file Python CLI that crawls a site (up to 50 URLs by default, sitemap first with link-crawl fallback) and audits each URL against **86 static checks + 7 runtime checks via headless Chromium** (on by default) across SEO, performance, security, accessibility, privacy, email DNS, and LLM-readiness. Site-wide signals (TLS cert, DNS, robots, email records, sitemap) run once; per-URL signals run per page. Output is a site-wide table + per-URL issues digest + aggregate summary.
 
 Covers the ground an Ahrefs / Screaming Frog / Sitebulb / Lighthouse / Google Search Console / PageSpeed audit would, for a single page. No headless browser, no multi-page crawl, no paid APIs — just `requests`, `BeautifulSoup`, `dnspython`, and stdlib `ssl` / `socket`.
 
 ## Install
 
+Core + browser mode together (browser is on by default):
+
+```sh
+pip install -r requirements.txt -r requirements-browser.txt
+playwright install chromium
+```
+
+Static-only install (skip browser — add `--no-browser` to every invocation):
+
 ```sh
 pip install -r requirements.txt
 ```
 
-Three deps: `requests`, `beautifulsoup4`, `dnspython`.
-
-**Optional — headless-browser mode** (adds 7 runtime checks: JS errors, console errors, failed requests, load time, FCP, LCP, CLS):
-
-```sh
-pip install -r requirements-browser.txt
-playwright install chromium
-```
+Deps: `requests`, `beautifulsoup4`, `dnspython`, `playwright` (optional).
 
 ## Run
 
 ```sh
-python check.py https://example.com                  # markdown report
+python check.py https://example.com                  # crawl site, 50 URLs max, browser on
+python check.py https://example.com --single         # just the input URL
+python check.py https://example.com --max-urls 20    # cap the crawl
+python check.py https://example.com --no-browser     # static-only (no Chromium)
 python check.py https://example.com --json           # JSON for CI
 python check.py https://example.com --fail-on fail   # exit 1 on any 🔴
 python check.py https://example.com --fail-on warn   # exit 1 on any 🟡 or 🔴
 python check.py https://example.com --no-progress    # silence stderr bar
-python check.py https://example.com --browser        # add headless-Chromium runtime checks
 ```
+
+URLs are discovered from the site's `sitemap.xml` (follows `<sitemapindex>` one level); if none, crawls internal `<a href>` links from the homepage.
 
 While running, a live progress bar renders on stderr:
 
@@ -40,13 +46,30 @@ Auto-disables when stderr isn't a TTY, so piped output stays clean.
 
 ## Output
 
-Markdown table grouped by category (`Shared` · `Security` · `SEO` · `LLM` · `Performance` · `Accessibility` · `Privacy` · `Email`), ending in a one-line summary:
+Default (crawl mode):
 
 ```
-**Summary:** ✅ 51 pass · 🟡 18 warn · 🔴 6 fail · ℹ️ 10 info
+# Site audit: https://example.com
+Audited **50** URL(s).
+Site-wide: ✅ 13 pass · 🟡 4 warn · 🔴 1 fail · ℹ️ 4 info
+
+## Site-wide checks  ← TLS, DNS, robots.txt, email, sitemap, llms.txt, …
+[full table per category]
+
+## Per-URL issues (WARN + FAIL only)
+| URL | Check | Status | Detail |
+...
+
+## Per-URL summary
+| URL | ✅ | 🟡 | 🔴 | ℹ️ |
+...
+
+**Aggregate:** ✅ 2415 pass · 🟡 210 warn · 🔴 85 fail · ℹ️ 100 info across site-wide + 50 URL(s)
 ```
 
-`--json` emits `{url, results: [{check, category, status, message, evidence}]}`.
+`--single`: compact single-page report (old format, one big table).
+
+`--json`: `{url, urls_audited, site_wide: [...], per_url: {url: [...], ...}}`.
 
 ## What it checks
 
