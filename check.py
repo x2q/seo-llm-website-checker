@@ -17,6 +17,7 @@ import socket
 import ssl
 import sys
 import warnings
+import queue
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, asdict, field
@@ -732,113 +733,170 @@ _BROWSER_INIT_SCRIPT = """
 """
 
 
+def _do_audit_on_context(context, url: str, timeout_ms: int) -> dict:
+    """Run one browser audit against `context` (called on the browser thread)."""
+    console_errors: list[dict] = []
+    console_warnings: list[dict] = []
+    page_errors: list[str] = []
+    failed_requests: list[dict] = []
+
+    page = context.new_page()
+    page.on("console", lambda msg: (
+        console_errors if msg.type == "error" else console_warnings
+    ).append({"text": msg.text[:200], "location": str(msg.location)})
+        if msg.type in ("error", "warning") else None)
+    page.on("pageerror", lambda err: page_errors.append(str(err)[:300]))
+    page.on("requestfailed", lambda req: failed_requests.append({
+        "url": req.url[:200],
+        "failure": (req.failure or "unknown")[:100],
+        "method": req.method,
+    }))
+    try:
+        response = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
+        page.wait_for_timeout(500)
+        metrics = page.evaluate("""() => {
+            const nav = performance.getEntriesByType('navigation')[0] || {};
+            const paint = performance.getEntriesByType('paint');
+            const fcp = paint.find(p => p.name === 'first-contentful-paint');
+            return {
+                domContentLoaded: nav.domContentLoadedEventEnd || 0,
+                loadComplete: nav.loadEventEnd || 0,
+                fcp: fcp ? fcp.startTime : 0,
+                lcp: (window.__webvitals && window.__webvitals.lcp) || 0,
+                cls: (window.__webvitals && window.__webvitals.cls) || 0,
+            };
+        }""")
+        status = response.status if response else None
+    except Exception as e:
+        return {"error": f"navigation failed: {e}"}
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+    return {
+        "status": status,
+        "console_errors": console_errors,
+        "console_warnings": console_warnings,
+        "page_errors": page_errors,
+        "failed_requests": failed_requests,
+        "dom_content_loaded_ms": int(metrics.get("domContentLoaded") or 0),
+        "load_complete_ms": int(metrics.get("loadComplete") or 0),
+        "fcp_ms": int(metrics.get("fcp") or 0),
+        "lcp_ms": int(metrics.get("lcp") or 0),
+        "cls": float(metrics.get("cls") or 0),
+    }
+
+
+def _fetch_html_on_context(context, url: str, wait_after_ms: int = 3000,
+                           wait_until: str = "domcontentloaded",
+                           timeout_ms: int = 30000) -> dict:
+    """Navigate and return {content, status} (called on the browser thread)."""
+    page = context.new_page()
+    try:
+        response = page.goto(url, wait_until=wait_until, timeout=timeout_ms)
+        page.wait_for_timeout(wait_after_ms)
+        return {"content": page.content(),
+                "status": response.status if response else None}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    finally:
+        try:
+            page.close()
+        except Exception:
+            pass
+
+
 class BrowserPool:
-    """One Playwright/Chromium instance reused across many URL navigations."""
+    """One Playwright/Chromium instance on a dedicated thread.
+
+    Playwright's sync API pins greenlets to the thread that created the
+    Playwright object, so parallel per-URL workers can't safely call it
+    directly. All navigations are enqueued to a single dedicated thread.
+    """
 
     def __init__(self) -> None:
-        self.pw = None
-        self.browser = None
-        self.context = None
         self.error: Optional[str] = None
-        self._lock = threading.Lock()
+        self._queue: queue.Queue = queue.Queue()
+        self._thread: Optional[threading.Thread] = None
+        self._started = threading.Event()
 
     def start(self) -> Optional[str]:
+        self._thread = threading.Thread(target=self._thread_main, daemon=True)
+        self._thread.start()
+        self._started.wait(timeout=30)
+        return self.error
+
+    def _thread_main(self) -> None:
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
             self.error = ("playwright not installed — run: pip install -r "
                           "requirements-browser.txt && playwright install chromium")
-            return self.error
+            self._started.set()
+            return
         try:
-            self.pw = sync_playwright().start()
-            self.browser = self.pw.chromium.launch(headless=True)
-            self.context = self.browser.new_context(
-                user_agent=DESKTOP_UA,
-                viewport={"width": 1350, "height": 940},
-            )
-            self.context.add_init_script(_BROWSER_INIT_SCRIPT)
+            pw = sync_playwright().start()
         except Exception as e:
-            self.error = f"could not launch chromium — run: playwright install chromium ({e})"
-            self.stop()
-            return self.error
-        return None
-
-    def audit(self, url: str, timeout_ms: int = 30000) -> dict:
-        # Playwright sync API is not thread-safe — serialise navigations on the shared context.
-        with self._lock:
-            return self._audit_locked(url, timeout_ms)
-
-    def _audit_locked(self, url: str, timeout_ms: int) -> dict:
-        if self.error or not self.context:
-            return {"error": self.error or "browser pool not started"}
-        console_errors: list[dict] = []
-        console_warnings: list[dict] = []
-        page_errors: list[str] = []
-        failed_requests: list[dict] = []
-
-        page = self.context.new_page()
-        page.on("console", lambda msg: (
-            console_errors if msg.type == "error" else console_warnings
-        ).append({"text": msg.text[:200], "location": str(msg.location)})
-            if msg.type in ("error", "warning") else None)
-        page.on("pageerror", lambda err: page_errors.append(str(err)[:300]))
-        page.on("requestfailed", lambda req: failed_requests.append({
-            "url": req.url[:200],
-            "failure": (req.failure or "unknown")[:100],
-            "method": req.method,
-        }))
+            self.error = f"could not start playwright: {e}"
+            self._started.set()
+            return
         try:
-            response = page.goto(url, wait_until="networkidle", timeout=timeout_ms)
-            page.wait_for_timeout(500)
-            metrics = page.evaluate("""() => {
-                const nav = performance.getEntriesByType('navigation')[0] || {};
-                const paint = performance.getEntriesByType('paint');
-                const fcp = paint.find(p => p.name === 'first-contentful-paint');
-                return {
-                    domContentLoaded: nav.domContentLoadedEventEnd || 0,
-                    loadComplete: nav.loadEventEnd || 0,
-                    fcp: fcp ? fcp.startTime : 0,
-                    lcp: (window.__webvitals && window.__webvitals.lcp) || 0,
-                    cls: (window.__webvitals && window.__webvitals.cls) || 0,
-                };
-            }""")
-            status = response.status if response else None
-        except Exception as e:
-            page.close()
-            return {"error": f"navigation failed: {e}"}
+            try:
+                browser = pw.chromium.launch(headless=True)
+            except Exception as e:
+                self.error = f"could not launch chromium — run: playwright install chromium ({e})"
+                self._started.set()
+                return
+            try:
+                context = browser.new_context(
+                    user_agent=DESKTOP_UA,
+                    viewport={"width": 1350, "height": 940},
+                )
+                context.add_init_script(_BROWSER_INIT_SCRIPT)
+                self._started.set()
+                while True:
+                    item = self._queue.get()
+                    if item is None:
+                        break
+                    func, result_box = item
+                    try:
+                        result_box["result"] = func(context)
+                    except Exception as e:
+                        result_box["result"] = {"error": f"{type(e).__name__}: {e}"}
+                    result_box["done"].set()
+            finally:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
         finally:
             try:
-                page.close()
+                pw.stop()
             except Exception:
                 pass
 
-        return {
-            "status": status,
-            "console_errors": console_errors,
-            "console_warnings": console_warnings,
-            "page_errors": page_errors,
-            "failed_requests": failed_requests,
-            "dom_content_loaded_ms": int(metrics.get("domContentLoaded") or 0),
-            "load_complete_ms": int(metrics.get("loadComplete") or 0),
-            "fcp_ms": int(metrics.get("fcp") or 0),
-            "lcp_ms": int(metrics.get("lcp") or 0),
-            "cls": float(metrics.get("cls") or 0),
-        }
+    def _dispatch(self, func: Callable) -> dict:
+        if self.error or not self._thread or not self._thread.is_alive():
+            return {"error": self.error or "browser pool not running"}
+        box: dict = {"result": None, "done": threading.Event()}
+        self._queue.put((func, box))
+        box["done"].wait()
+        return box["result"] or {}
+
+    def audit(self, url: str, timeout_ms: int = 30000) -> dict:
+        return self._dispatch(lambda ctx: _do_audit_on_context(ctx, url, timeout_ms))
+
+    def fetch_html(self, url: str, wait_after_ms: int = 3000,
+                   timeout_ms: int = 30000) -> dict:
+        return self._dispatch(
+            lambda ctx: _fetch_html_on_context(ctx, url, wait_after_ms,
+                                               "domcontentloaded", timeout_ms))
 
     def stop(self) -> None:
-        try:
-            if self.browser:
-                self.browser.close()
-        except Exception:
-            pass
-        try:
-            if self.pw:
-                self.pw.stop()
-        except Exception:
-            pass
-        self.browser = None
-        self.pw = None
-        self.context = None
+        if self._thread and self._thread.is_alive():
+            self._queue.put(None)
+            self._thread.join(timeout=15)
 
 
 # kept for backwards compat
@@ -3131,7 +3189,7 @@ def check_meta_ad_library(s: Site) -> CheckResult:
         return CheckResult("meta_ad_library", "ads", INFO,
                            "skipped (pass --ads-deep to scrape Meta Ad Library)")
     pool = s.browser_pool_ref
-    if pool is None or pool.context is None:
+    if pool is None or pool.error:
         return CheckResult("meta_ad_library", "ads", INFO,
                            "--ads-deep needs --browser (Chromium unavailable)")
     host = urlparse(s.final_url).hostname or ""
@@ -3140,21 +3198,11 @@ def check_meta_ad_library(s: Site) -> CheckResult:
     url = ("https://www.facebook.com/ads/library/"
            "?active_status=active&ad_type=all&country=ALL"
            f"&q={quote(query, safe='')}&search_type=keyword_unordered")
-    with pool._lock:
-        page = pool.context.new_page()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)  # let Facebook's JS settle
-            content = page.content()
-        except Exception as e:
-            page.close()
-            return CheckResult("meta_ad_library", "ads", INFO,
-                               f"scrape failed: {type(e).__name__}")
-        finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+    result = pool.fetch_html(url, wait_after_ms=3000, timeout_ms=30000)
+    if "error" in result:
+        return CheckResult("meta_ad_library", "ads", INFO,
+                           f"scrape failed: {result['error']}")
+    content = result.get("content", "")
     m = re.search(r"~?(\d{1,3}(?:[,.]\d{3})*)\s*(?:result|ads?\b)", content, re.I)
     if m:
         return CheckResult("meta_ad_library", "ads", PASS,
@@ -3172,28 +3220,18 @@ def check_google_ads_transparency(s: Site) -> CheckResult:
         return CheckResult("google_ads_transparency", "ads", INFO,
                            "skipped (pass --ads-deep to scrape Google Ads Transparency)")
     pool = s.browser_pool_ref
-    if pool is None or pool.context is None:
+    if pool is None or pool.error:
         return CheckResult("google_ads_transparency", "ads", INFO,
                            "--ads-deep needs --browser")
     host = urlparse(s.final_url).hostname or ""
     domain = _registered_domain(host)
     query = domain.split(".")[0]
     url = f"https://adstransparency.google.com/?region=anywhere&q={quote(query, safe='')}"
-    with pool._lock:
-        page = pool.context.new_page()
-        try:
-            page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            page.wait_for_timeout(3000)
-            content = page.content()
-        except Exception as e:
-            page.close()
-            return CheckResult("google_ads_transparency", "ads", INFO,
-                               f"scrape failed: {type(e).__name__}")
-        finally:
-            try:
-                page.close()
-            except Exception:
-                pass
+    result = pool.fetch_html(url, wait_after_ms=3000, timeout_ms=30000)
+    if "error" in result:
+        return CheckResult("google_ads_transparency", "ads", INFO,
+                           f"scrape failed: {result['error']}")
+    content = result.get("content", "")
     m = re.search(r"(\d{1,3}(?:,\d{3})*)\s*(?:ads?\b|advertisers)", content, re.I)
     if m:
         return CheckResult("google_ads_transparency", "ads", PASS,
