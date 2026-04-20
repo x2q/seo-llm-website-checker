@@ -224,6 +224,178 @@ def check_dual_stack_assets(s: Site) -> CheckResult:
                        f"{len(results)} asset host(s) all dual-stack (A + AAAA)")
 
 
+# ---------- Email DNS checks (MX, SPF, DKIM, DMARC, MTA-STS) ----------
+
+COMMON_DKIM_SELECTORS = [
+    "default", "google", "selector1", "selector2", "mail", "k1", "k2",
+    "s1", "s2", "mandrill", "sendgrid", "mailgun", "postmark", "zoho",
+    "smtpapi", "fm1", "fm2", "fm3", "pic", "protonmail", "protonmail2",
+    "protonmail3", "mxvault", "microsoft",
+]
+
+
+def _email_domain(site_host: str) -> str:
+    """Strip leading www. — email is almost always on the bare apex for the common case."""
+    return site_host[4:] if site_host.startswith("www.") else site_host
+
+
+def _dns_txt(domain: str, timeout: float = 4.0) -> tuple[list[str], Optional[str]]:
+    import dns.resolver
+    import dns.exception
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
+    try:
+        answer = resolver.resolve(domain, "TXT", raise_on_no_answer=False)
+        out: list[str] = []
+        if answer.rrset is not None:
+            for r in answer:
+                out.append(b"".join(r.strings).decode("utf-8", errors="replace"))
+        return out, None
+    except dns.resolver.NXDOMAIN:
+        return [], "NXDOMAIN"
+    except (dns.resolver.NoNameservers, dns.exception.Timeout) as e:
+        return [], str(e)
+
+
+def _dns_mx(domain: str, timeout: float = 4.0) -> tuple[list[tuple[int, str]], Optional[str]]:
+    import dns.resolver
+    import dns.exception
+    resolver = dns.resolver.Resolver()
+    resolver.timeout = timeout
+    resolver.lifetime = timeout
+    try:
+        answer = resolver.resolve(domain, "MX", raise_on_no_answer=False)
+        records: list[tuple[int, str]] = []
+        if answer.rrset is not None:
+            for r in answer:
+                records.append((r.preference, str(r.exchange).rstrip(".")))
+        records.sort()
+        return records, None
+    except dns.resolver.NXDOMAIN:
+        return [], "NXDOMAIN"
+    except (dns.resolver.NoNameservers, dns.exception.Timeout) as e:
+        return [], str(e)
+
+
+def check_mx_records(s: Site) -> CheckResult:
+    """Domain can receive email (has MX records)."""
+    domain = _email_domain(urlparse(s.final_url).hostname or "")
+    mx, err = _dns_mx(domain)
+    if err and err != "NXDOMAIN":
+        return CheckResult("mx_records", "email", WARN, f"{domain}: {err}")
+    if not mx:
+        return CheckResult("mx_records", "email", WARN,
+                           f"{domain} has no MX records — domain can't receive email")
+    primary = mx[0]
+    return CheckResult("mx_records", "email", PASS,
+                       f"{len(mx)} MX record(s); primary: {primary[1]} (pref {primary[0]})")
+
+
+def check_spf_record(s: Site) -> CheckResult:
+    """v=spf1 TXT record at the apex prevents email spoofing."""
+    domain = _email_domain(urlparse(s.final_url).hostname or "")
+    txts, err = _dns_txt(domain)
+    if err and err != "NXDOMAIN":
+        return CheckResult("spf_record", "email", WARN, f"{domain}: {err}")
+    spf = [t for t in txts if t.lower().startswith("v=spf1")]
+    if not spf:
+        return CheckResult("spf_record", "email", FAIL,
+                           f"{domain} has no v=spf1 TXT record — attackers can spoof your emails")
+    if len(spf) > 1:
+        return CheckResult("spf_record", "email", FAIL,
+                           f"{len(spf)} SPF records — RFC forbids more than one; many receivers reject all")
+    record = spf[0]
+    ending = record.rsplit(" ", 1)[-1].lower()
+    if ending in ("-all", "~all"):
+        return CheckResult("spf_record", "email", PASS,
+                           f"{ending} policy: {record[:100]}")
+    if ending == "?all":
+        return CheckResult("spf_record", "email", WARN,
+                           f"?all (neutral) — attackers still succeed: {record[:100]}")
+    if ending == "+all":
+        return CheckResult("spf_record", "email", FAIL,
+                           f"+all — any host can send as this domain: {record[:100]}")
+    return CheckResult("spf_record", "email", WARN,
+                       f"no explicit 'all' mechanism — policy ambiguous: {record[:100]}")
+
+
+def check_dmarc_record(s: Site) -> CheckResult:
+    """v=DMARC1 TXT at _dmarc.domain — tells receivers what to do with failing mail."""
+    domain = _email_domain(urlparse(s.final_url).hostname or "")
+    txts, err = _dns_txt(f"_dmarc.{domain}")
+    if err and err != "NXDOMAIN":
+        return CheckResult("dmarc_record", "email", WARN, f"_dmarc.{domain}: {err}")
+    dmarc = [t for t in txts if t.lower().startswith("v=dmarc1")]
+    if not dmarc:
+        return CheckResult("dmarc_record", "email", FAIL,
+                           f"no DMARC policy at _dmarc.{domain} — spoofed mail is delivered without review")
+    record = dmarc[0].lower()
+    m = re.search(r"\bp\s*=\s*(none|quarantine|reject)", record)
+    policy = m.group(1) if m else "?"
+    pct_m = re.search(r"\bpct\s*=\s*(\d+)", record)
+    pct = pct_m.group(1) if pct_m else "100"
+    if policy == "reject":
+        return CheckResult("dmarc_record", "email", PASS,
+                           f"p=reject pct={pct} — strongest policy")
+    if policy == "quarantine":
+        return CheckResult("dmarc_record", "email", PASS,
+                           f"p=quarantine pct={pct}")
+    if policy == "none":
+        return CheckResult("dmarc_record", "email", WARN,
+                           f"p=none (monitoring only) — consider tightening to quarantine/reject")
+    return CheckResult("dmarc_record", "email", WARN,
+                       f"DMARC TXT present but no p= tag: {dmarc[0][:100]}")
+
+
+def _probe_dkim_selector(domain: str, selector: str) -> Optional[str]:
+    txts, err = _dns_txt(f"{selector}._domainkey.{domain}", timeout=2.0)
+    if err or not txts:
+        return None
+    for t in txts:
+        if "v=DKIM1" in t or "k=" in t or "p=" in t:
+            return t
+    return None
+
+
+def check_dkim_record(s: Site) -> CheckResult:
+    """DKIM key published under at least one common selector."""
+    domain = _email_domain(urlparse(s.final_url).hostname or "")
+    # parallelise the selector probes
+    with ThreadPoolExecutor(max_workers=8) as ex:
+        futures = {ex.submit(_probe_dkim_selector, domain, sel): sel
+                   for sel in COMMON_DKIM_SELECTORS}
+        found: list[str] = []
+        for fut in futures:
+            sel = futures[fut]
+            try:
+                txt = fut.result()
+            except Exception:
+                continue
+            if txt:
+                found.append(sel)
+    if found:
+        return CheckResult("dkim_record", "email", PASS,
+                           f"DKIM published under selector(s): {', '.join(sorted(found))}")
+    return CheckResult("dkim_record", "email", WARN,
+                       f"no DKIM key found at any common selector "
+                       f"({len(COMMON_DKIM_SELECTORS)} tried) — your provider's "
+                       "selector may differ; verify manually if email is configured")
+
+
+def check_mta_sts(s: Site) -> CheckResult:
+    """MTA-STS enforces TLS for inbound mail (optional but modern)."""
+    domain = _email_domain(urlparse(s.final_url).hostname or "")
+    txts, err = _dns_txt(f"_mta-sts.{domain}")
+    if err and err != "NXDOMAIN":
+        return CheckResult("mta_sts", "email", INFO, f"_mta-sts.{domain}: {err}")
+    sts = [t for t in txts if t.lower().startswith("v=stsv1")]
+    if sts:
+        return CheckResult("mta_sts", "email", PASS, f"MTA-STS record: {sts[0][:80]}")
+    return CheckResult("mta_sts", "email", INFO,
+                       "no MTA-STS (optional; enforces TLS for inbound mail)")
+
+
 def check_http_to_https(s: Site) -> CheckResult:
     p = urlparse(s.final_url)
     http_url = urlunparse(p._replace(scheme="http"))
@@ -704,28 +876,49 @@ def _sitemap_url(s: Site) -> str:
 SITEMAP_NS = "{http://www.sitemaps.org/schemas/sitemap/0.9}"
 
 
-def _parse_sitemap(session: requests.Session, url: str,
-                   depth: int = 0) -> tuple[Optional[ET.Element], Optional[str]]:
+SITEMAP_GOOD_CTS = ("application/xml", "text/xml", "application/rss+xml",
+                    "application/atom+xml", "text/plain")
+
+
+def _parse_sitemap(session: requests.Session, url: str, depth: int = 0
+                   ) -> tuple[Optional[ET.Element], Optional[str], Optional[int], Optional[str]]:
+    """Return (root, error, status_code, content_type)."""
     try:
         r = fetch(session, url)
     except requests.RequestException as e:
-        return None, f"{url}: {e}"
+        return None, f"{url}: {e}", None, None
+    ct = r.headers.get("Content-Type", "").lower().split(";")[0].strip()
     if r.status_code != 200:
-        return None, f"{r.status_code} {url}"
-    ct = r.headers.get("Content-Type", "").lower()
-    if not ("xml" in ct or "text/plain" in ct):
-        return None, f"{url} served as {ct!r} (expected xml)"
+        return None, f"{r.status_code} {url}", r.status_code, ct
+    if not ct or ct not in SITEMAP_GOOD_CTS:
+        return None, f"{url} served as {ct!r} (expected application/xml)", r.status_code, ct
     try:
-        return ET.fromstring(r.text), None
+        return ET.fromstring(r.text), None, r.status_code, ct
     except ET.ParseError as e:
-        return None, f"{url} invalid XML: {e}"
+        return None, f"{url} invalid XML at {e}", r.status_code, ct
 
 
 def check_sitemap(s: Site) -> tuple[CheckResult, list[str]]:
     url = _sitemap_url(s)
-    root, err = _parse_sitemap(s.session, url)
-    if err or root is None:
-        return CheckResult("sitemap_xml", "seo", FAIL, err or "parse failed"), []
+    root, err, status, ct = _parse_sitemap(s.session, url)
+
+    # explicit status-first reporting (like robots_txt)
+    if status is None:
+        return CheckResult("sitemap_xml", "seo", FAIL, err or "fetch failed", url), []
+    if status == 404:
+        return CheckResult("sitemap_xml", "seo", FAIL,
+                           f"404 {url} — Google needs a sitemap to discover URLs"), []
+    if status >= 500:
+        return CheckResult("sitemap_xml", "seo", FAIL,
+                           f"{status} server error on {url}"), []
+    if status != 200:
+        return CheckResult("sitemap_xml", "seo", FAIL, f"{status} {url}"), []
+    if ct and ct not in SITEMAP_GOOD_CTS:
+        return CheckResult("sitemap_xml", "seo", FAIL,
+                           f"200 but Content-Type={ct!r} (want application/xml) — "
+                           "Google may reject as not a sitemap"), []
+    if root is None:
+        return CheckResult("sitemap_xml", "seo", FAIL, err or "parse failed", url), []
 
     # sitemap index: recurse one level into child sitemaps
     child_locs = [loc.text.strip()
@@ -738,7 +931,7 @@ def check_sitemap(s: Site) -> tuple[CheckResult, list[str]]:
 
     if is_index:
         for child_url in child_locs[:5]:
-            sub_root, sub_err = _parse_sitemap(s.session, child_url, depth=1)
+            sub_root, sub_err, _, _ = _parse_sitemap(s.session, child_url, depth=1)
             if sub_err or sub_root is None:
                 sub_errors.append(sub_err or child_url)
                 continue
@@ -765,9 +958,11 @@ def check_sitemap(s: Site) -> tuple[CheckResult, list[str]]:
             issues.append("non-ASCII URL not percent-encoded")
             break
     prefix = "sitemap index: " if is_index else ""
-    status = WARN if issues else PASS
-    msg = f"{prefix}{len(locs)} URLs" + (f"; {', '.join(issues)}" if issues else "")
-    return CheckResult("sitemap_xml", "seo", status, msg, url), locs
+    verdict = WARN if issues else PASS
+    ct_note = ct or "?"
+    msg = (f"200 {ct_note}, {prefix}{len(locs)} URLs"
+           + (f"; {', '.join(issues)}" if issues else ""))
+    return CheckResult("sitemap_xml", "seo", verdict, msg, url), locs
 
 
 def check_sitemap_urls_reachable(s: Site, locs: list[str]) -> CheckResult:
@@ -1612,6 +1807,9 @@ CHECKS: list[CheckFn] = [
     # llm
     check_llms_txt, check_llms_full_txt, check_ai_crawlers,
     check_citable_facts, check_faq_schema,
+    # email
+    check_mx_records, check_spf_record, check_dmarc_record,
+    check_dkim_record, check_mta_sts,
     # perf
     check_page_response_time, check_html_size,
     check_images_dimensions, check_image_sizes, check_image_modern_format,
@@ -1688,7 +1886,7 @@ def run_all(url: str, progress: bool = True) -> list[CheckResult]:
         results.append(r)
         bar.tick(r)
     bar.close()
-    order = {"shared": 0, "seo": 1, "llm": 2, "perf": 3}
+    order = {"shared": 0, "seo": 1, "llm": 2, "perf": 3, "email": 4}
     results.sort(key=lambda r: (order.get(r.category, 9), r.check))
     return results
 
@@ -1697,7 +1895,8 @@ def render_markdown(url: str, results: Iterable[CheckResult]) -> str:
     results = list(results)
     lines = [f"# SEO + LLM check: {url}\n"]
     categories = [("shared", "Shared / Transport"), ("seo", "SEO"),
-                  ("llm", "LLM-readiness"), ("perf", "Performance")]
+                  ("llm", "LLM-readiness"), ("perf", "Performance"),
+                  ("email", "Email / DNS")]
     for cat, label in categories:
         rows = [r for r in results if r.category == cat]
         if not rows:
