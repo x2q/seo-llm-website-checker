@@ -36,6 +36,20 @@ IMAGE_SIZE_FAIL = 500 * 1024         # 500 KB
 CSS_SIZE_WARN = 100 * 1024           # 100 KB per CSS file
 JS_SIZE_WARN = 300 * 1024            # informational
 ASSET_SAMPLE = 10                    # cap HEAD requests per asset type
+INLINE_ASSET_WARN = 50 * 1024        # 50 KB of inline <script>/<style>
+INLINE_ASSET_FAIL = 150 * 1024
+DOM_ELEMENTS_WARN = 1500
+DOM_ELEMENTS_FAIL = 3000
+DOM_DEPTH_WARN = 32
+DOM_DEPTH_FAIL = 60
+TEXT_RATIO_WARN = 0.10
+TEXT_RATIO_FAIL = 0.05
+GENERIC_ANCHOR_TEXT = {
+    "click here", "here", "read more", "learn more", "more", "more info",
+    "link", "this", "this link", "view", "see more", "details", "go",
+    # Danish equivalents for this codebase's .dk sites
+    "læs mere", "klik her", "mere", "se mere", "her", "læs", "gå",
+}
 
 PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
 ICON = {PASS: "✅", WARN: "🟡", FAIL: "🔴", INFO: "ℹ️"}
@@ -857,21 +871,282 @@ def check_lcp_hints(s: Site) -> CheckResult:
 
 # --------- runner ---------
 
+# ---------- new checks (Ahrefs / Screaming Frog / Sitebulb / Lighthouse coverage) ----------
+
+def check_doctype(s: Site) -> CheckResult:
+    head = s.response.text[:200].lstrip()
+    if re.match(r"(?i)<!doctype\s+html\s*>", head):
+        return CheckResult("doctype_present", "shared", PASS, "<!DOCTYPE html>")
+    m = re.match(r"(?i)<!doctype[^>]+>", head)
+    if m:
+        return CheckResult("doctype_present", "shared", WARN,
+                           f"non-HTML5 doctype: {m.group(0)}")
+    return CheckResult("doctype_present", "shared", FAIL, "no doctype declaration")
+
+
+def check_meta_charset_early(s: Site) -> CheckResult:
+    head_bytes = s.response.content[:2048]
+    m = re.search(rb"(?i)<meta[^>]+charset", head_bytes)
+    if not m:
+        # might be in HTTP header instead, which is acceptable
+        if "charset" in s.response.headers.get("Content-Type", "").lower():
+            return CheckResult("meta_charset_early", "shared", PASS,
+                               "declared in Content-Type header")
+        return CheckResult("meta_charset_early", "shared", FAIL,
+                           "no charset in HTML or Content-Type header")
+    offset = m.start()
+    if offset > 1024:
+        return CheckResult("meta_charset_early", "shared", WARN,
+                           f"declared at byte {offset} (>1024)")
+    return CheckResult("meta_charset_early", "shared", PASS, f"declared at byte {offset}")
+
+
+def check_mixed_content(s: Site) -> CheckResult:
+    if not s.final_url.startswith("https://"):
+        return CheckResult("mixed_content", "shared", INFO, "page not served over https")
+    bad: list[str] = []
+    selectors = [("img", "src"), ("script", "src"), ("iframe", "src"),
+                 ("video", "src"), ("audio", "src"), ("source", "src"),
+                 ("link", "href")]
+    for tag, attr in selectors:
+        for el in s.soup.find_all(tag):
+            v = (el.get(attr) or "").strip()
+            if v.startswith("http://"):
+                bad.append(f"<{tag} {attr}={v}>")
+                if len(bad) >= 5:
+                    break
+        if len(bad) >= 5:
+            break
+    if bad:
+        return CheckResult("mixed_content", "shared", FAIL,
+                           f"{len(bad)} http:// resource(s): {bad[0]}")
+    return CheckResult("mixed_content", "shared", PASS, "no http:// resources")
+
+
+def check_security_headers(s: Site) -> CheckResult:
+    h = s.response.headers
+    checks = {
+        "X-Content-Type-Options": "nosniff" in (h.get("X-Content-Type-Options", "")).lower(),
+        "Referrer-Policy": bool(h.get("Referrer-Policy")),
+        "Content-Security-Policy": bool(h.get("Content-Security-Policy")),
+        "Permissions-Policy": bool(h.get("Permissions-Policy")),
+    }
+    missing = [k for k, ok in checks.items() if not ok]
+    if not missing:
+        return CheckResult("security_headers", "shared", PASS, "all four present")
+    if len(missing) <= 2:
+        return CheckResult("security_headers", "shared", WARN,
+                           f"missing: {', '.join(missing)}")
+    return CheckResult("security_headers", "shared", FAIL,
+                       f"missing: {', '.join(missing)}")
+
+
+def check_meta_refresh(s: Site) -> CheckResult:
+    m = s.soup.find("meta", attrs={"http-equiv": re.compile("^refresh$", re.I)})
+    if not m:
+        return CheckResult("meta_refresh_redirect", "shared", PASS, "no meta refresh")
+    content = (m.get("content") or "")
+    if re.search(r"url\s*=", content, re.I):
+        return CheckResult("meta_refresh_redirect", "shared", FAIL,
+                           f"client-side redirect: {content}")
+    return CheckResult("meta_refresh_redirect", "shared", WARN,
+                       f"meta refresh present: {content}")
+
+
+def check_meta_robots_indexable(s: Site) -> CheckResult:
+    m = s.soup.find("meta", attrs={"name": re.compile("^robots$", re.I)})
+    content = (m.get("content") or "").lower() if m else ""
+    header = s.response.headers.get("X-Robots-Tag", "").lower()
+    combined = f"{content} {header}"
+    if "noindex" in combined:
+        return CheckResult("meta_robots_indexable", "seo", FAIL,
+                           f"noindex set: meta={content!r} header={header!r}")
+    if "nofollow" in combined:
+        return CheckResult("meta_robots_indexable", "seo", WARN,
+                           f"nofollow set: meta={content!r} header={header!r}")
+    return CheckResult("meta_robots_indexable", "seo", PASS,
+                       content or "(default indexable)")
+
+
+def check_viewport_scalable(s: Site) -> CheckResult:
+    m = s.soup.find("meta", attrs={"name": re.compile("^viewport$", re.I)})
+    c = (m.get("content") or "").lower().replace(" ", "") if m else ""
+    if not c:
+        return CheckResult("viewport_accessible", "seo", INFO,
+                           "no viewport (covered by viewport_meta)")
+    if "user-scalable=no" in c or re.search(r"maximum-scale=1(?:\.0)?\b", c):
+        return CheckResult("viewport_accessible", "seo", WARN,
+                           f"zoom disabled (a11y issue): {c}")
+    return CheckResult("viewport_accessible", "seo", PASS, "zoom not disabled")
+
+
+def check_external_link_safety(s: Site) -> CheckResult:
+    host = urlparse(s.final_url).netloc
+    unsafe: list[str] = []
+    total_external_blank = 0
+    for a in s.soup.find_all("a", href=True, target="_blank"):
+        href = urljoin(s.final_url, a["href"])
+        if urlparse(href).netloc and urlparse(href).netloc != host:
+            total_external_blank += 1
+            rel = " ".join(a.get("rel", []) if isinstance(a.get("rel"), list)
+                           else [a.get("rel", "")])
+            if "noopener" not in rel.lower():
+                unsafe.append(href)
+    if total_external_blank == 0:
+        return CheckResult("external_link_rel_safety", "seo", INFO,
+                           "no external target=_blank links")
+    if unsafe:
+        return CheckResult("external_link_rel_safety", "seo", FAIL,
+                           f"{len(unsafe)}/{total_external_blank} missing rel=noopener: {unsafe[0]}")
+    return CheckResult("external_link_rel_safety", "seo", PASS,
+                       f"{total_external_blank} external _blank links all safe")
+
+
+def check_descriptive_link_text(s: Site) -> CheckResult:
+    links = s.soup.find_all("a", href=True)
+    if len(links) < 5:
+        return CheckResult("descriptive_link_text", "seo", INFO,
+                           f"only {len(links)} links — skipping")
+    generic = 0
+    total = 0
+    for a in links:
+        txt = a.get_text(" ", strip=True).lower()
+        if not txt:
+            # skip icon-only links (should ideally have aria-label but checked elsewhere)
+            continue
+        total += 1
+        if txt in GENERIC_ANCHOR_TEXT or re.fullmatch(r"https?://\S+", txt):
+            generic += 1
+    if total == 0:
+        return CheckResult("descriptive_link_text", "seo", WARN,
+                           "all links have empty text")
+    pct = generic * 100 // total
+    if pct > 40:
+        return CheckResult("descriptive_link_text", "seo", FAIL,
+                           f"{generic}/{total} generic ({pct}%)")
+    if pct > 20:
+        return CheckResult("descriptive_link_text", "seo", WARN,
+                           f"{generic}/{total} generic ({pct}%)")
+    return CheckResult("descriptive_link_text", "seo", PASS,
+                       f"{generic}/{total} generic ({pct}%)")
+
+
+def check_text_to_html_ratio(s: Site) -> CheckResult:
+    html_len = len(s.response.text)
+    if html_len == 0:
+        return CheckResult("text_to_html_ratio", "seo", FAIL, "empty HTML")
+    # strip scripts + styles before measuring visible text
+    copy = BeautifulSoup(s.response.text, "html.parser")
+    for tag in copy(["script", "style", "noscript"]):
+        tag.decompose()
+    text = copy.get_text(" ", strip=True)
+    ratio = len(text) / html_len
+    words = len(text.split())
+    if words < 50:
+        return CheckResult("text_to_html_ratio", "seo", FAIL,
+                           f"only {words} visible words — thin content")
+    if ratio < TEXT_RATIO_FAIL:
+        return CheckResult("text_to_html_ratio", "seo", FAIL,
+                           f"ratio {ratio:.1%} ({words} words)")
+    if ratio < TEXT_RATIO_WARN:
+        return CheckResult("text_to_html_ratio", "seo", WARN,
+                           f"ratio {ratio:.1%} ({words} words)")
+    return CheckResult("text_to_html_ratio", "seo", PASS,
+                       f"ratio {ratio:.1%} ({words} words)")
+
+
+def check_inline_asset_size(s: Site) -> CheckResult:
+    total = 0
+    for t in s.soup.find_all(["script", "style"]):
+        if t.name == "script" and t.get("src"):
+            continue
+        total += len(t.string or "")
+    kb = total / 1024
+    if total >= INLINE_ASSET_FAIL:
+        return CheckResult("inline_asset_size", "perf", FAIL, f"{kb:.0f} KB inline")
+    if total >= INLINE_ASSET_WARN:
+        return CheckResult("inline_asset_size", "perf", WARN, f"{kb:.0f} KB inline")
+    return CheckResult("inline_asset_size", "perf", PASS, f"{kb:.0f} KB inline")
+
+
+def check_dom_size(s: Site) -> CheckResult:
+    elements = s.soup.find_all()
+    count = len(elements)
+    # max nesting depth — walk the tree
+    def depth(node, d: int = 0) -> int:
+        children = [c for c in getattr(node, "children", []) if getattr(c, "name", None)]
+        if not children:
+            return d
+        return max(depth(c, d + 1) for c in children)
+    max_depth = depth(s.soup)
+    if count >= DOM_ELEMENTS_FAIL or max_depth >= DOM_DEPTH_FAIL:
+        return CheckResult("dom_size", "perf", FAIL,
+                           f"{count} elements, depth {max_depth}")
+    if count >= DOM_ELEMENTS_WARN or max_depth >= DOM_DEPTH_WARN:
+        return CheckResult("dom_size", "perf", WARN,
+                           f"{count} elements, depth {max_depth}")
+    return CheckResult("dom_size", "perf", PASS,
+                       f"{count} elements, depth {max_depth}")
+
+
+def check_image_modern_format(s: Site) -> CheckResult:
+    imgs = s.soup.find_all("img")
+    if len(imgs) < 3:
+        return CheckResult("image_modern_format", "perf", INFO,
+                           f"only {len(imgs)} images")
+    modern_exts = (".webp", ".avif")
+    modern = 0
+    legacy: list[str] = []
+    for img in imgs:
+        src = (img.get("src") or "").lower()
+        srcset = (img.get("srcset") or "").lower()
+        picture = img.find_parent("picture")
+        has_modern_source = False
+        if picture:
+            for src_el in picture.find_all("source"):
+                stype = (src_el.get("type") or "").lower()
+                if "webp" in stype or "avif" in stype:
+                    has_modern_source = True
+                    break
+        if src.endswith(modern_exts) or any(e in srcset for e in modern_exts) or has_modern_source:
+            modern += 1
+        else:
+            legacy.append(src.split("/")[-1][:40])
+    pct = modern * 100 // len(imgs)
+    if pct >= 80:
+        return CheckResult("image_modern_format", "perf", PASS,
+                           f"{modern}/{len(imgs)} modern ({pct}%)")
+    if pct >= 50:
+        return CheckResult("image_modern_format", "perf", WARN,
+                           f"{modern}/{len(imgs)} modern ({pct}%) — example: {legacy[0]}")
+    return CheckResult("image_modern_format", "perf", FAIL,
+                       f"{modern}/{len(imgs)} modern ({pct}%) — convert to webp/avif")
+
+
 CheckFn = Callable[[Site], CheckResult]
 
 CHECKS: list[CheckFn] = [
+    # shared
     check_https_reachable, check_http_to_https, check_www_apex, check_hsts,
-    check_content_type, check_x_robots,
+    check_content_type, check_x_robots, check_doctype, check_meta_charset_early,
+    check_mixed_content, check_security_headers, check_meta_refresh,
+    check_robots_txt,
+    # seo
     check_title, check_meta_description, check_canonical, check_canonical_not_redirect,
-    check_h1, check_html_lang,
-    check_viewport, check_favicon, check_apple_touch_icon, check_images_alt, check_open_graph,
+    check_meta_robots_indexable, check_h1, check_html_lang,
+    check_viewport, check_viewport_scalable,
+    check_favicon, check_apple_touch_icon, check_images_alt, check_open_graph,
     check_twitter_card, check_json_ld, check_hreflang,
-    check_robots_txt, check_outgoing_links_present,
+    check_outgoing_links_present, check_external_link_safety,
+    check_descriptive_link_text, check_text_to_html_ratio,
+    # llm
     check_llms_txt, check_llms_full_txt, check_ai_crawlers,
     check_citable_facts, check_faq_schema,
+    # perf
     check_page_response_time, check_html_size,
-    check_images_dimensions, check_image_sizes,
+    check_images_dimensions, check_image_sizes, check_image_modern_format,
     check_css_sizes, check_js_assets_reachable,
+    check_inline_asset_size, check_dom_size,
     check_render_blocking, check_lcp_hints,
 ]
 
