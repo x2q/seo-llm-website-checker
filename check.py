@@ -26,6 +26,17 @@ UA = "Mozilla/5.0 (compatible; SEOLLMChecker/1.0; +https://github.com/)"
 TIMEOUT = 15
 AI_BOTS = ["GPTBot", "ClaudeBot", "PerplexityBot", "Google-Extended", "CCBot"]
 
+# Ahrefs-style thresholds
+SLOW_PAGE_WARN_MS = 2000
+SLOW_PAGE_FAIL_MS = 5000
+HTML_SIZE_WARN = 500 * 1024          # 500 KB
+HTML_SIZE_FAIL = 2 * 1024 * 1024     # 2 MB
+IMAGE_SIZE_WARN = 200 * 1024         # 200 KB per image (Ahrefs default)
+IMAGE_SIZE_FAIL = 500 * 1024         # 500 KB
+CSS_SIZE_WARN = 100 * 1024           # 100 KB per CSS file
+JS_SIZE_WARN = 300 * 1024            # informational
+ASSET_SAMPLE = 10                    # cap HEAD requests per asset type
+
 PASS, WARN, FAIL, INFO = "PASS", "WARN", "FAIL", "INFO"
 ICON = {PASS: "✅", WARN: "🟡", FAIL: "🔴", INFO: "ℹ️"}
 
@@ -485,31 +496,194 @@ def check_sitemap_urls_reachable(s: Site, locs: list[str]) -> CheckResult:
                        f"{len(sample)} sampled, all 200 self-canonical")
 
 
-def check_internal_links(s: Site) -> CheckResult:
+def _outgoing_links(s: Site) -> tuple[list[str], list[str]]:
+    """Return (internal_links, external_links) on the page, excluding fragments/mailto/tel."""
     host = urlparse(s.final_url).netloc
-    links = []
+    internal: list[str] = []
+    external: list[str] = []
+    seen: set[str] = set()
     for a in s.soup.find_all("a", href=True):
-        u = urljoin(s.final_url, a["href"])
-        if urlparse(u).netloc == host and u not in links:
-            links.append(u)
-    sample = links[:10]
+        href = a["href"].strip()
+        if not href or href.startswith(("#", "mailto:", "tel:", "javascript:")):
+            continue
+        u = urljoin(s.final_url, href)
+        p = urlparse(u)
+        if p.scheme not in ("http", "https"):
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        (internal if p.netloc == host else external).append(u)
+    return internal, external
+
+
+def check_outgoing_links_present(s: Site) -> CheckResult:
+    internal, external = _outgoing_links(s)
+    total = len(internal) + len(external)
+    if total == 0:
+        return CheckResult("outgoing_links_present", "seo", FAIL,
+                           "page has no outgoing links — dead-end for crawlers")
+    return CheckResult("outgoing_links_present", "seo", PASS,
+                       f"{len(internal)} internal, {len(external)} external")
+
+
+def _probe_internal_links(s: Site) -> tuple[list[CheckResult], None]:
+    internal, _ = _outgoing_links(s)
+    sample = internal[:10]
+    broken: list[str] = []
+    redirected: list[str] = []
     if not sample:
-        return CheckResult("internal_links_reachable", "seo", INFO, "no internal links")
-    broken = []
+        info = CheckResult("internal_links_not_broken", "seo", INFO, "no internal links")
+        info2 = CheckResult("internal_links_not_redirecting", "seo", INFO, "no internal links")
+        return [info, info2], None
     for u in sample:
         try:
-            r = s.session.head(u, timeout=TIMEOUT, allow_redirects=True,
+            r = s.session.head(u, timeout=TIMEOUT, allow_redirects=False,
                                headers={"User-Agent": UA})
-            if r.status_code == 405:
-                r = fetch(s.session, u)
-            if r.status_code >= 400:
-                broken.append(f"{u} [{r.status_code}]")
+            if r.status_code in (403, 405):
+                r = fetch(s.session, u, allow_redirects=False)
+            code = r.status_code
+            if code in (301, 302, 303, 307, 308):
+                redirected.append(f"{u} [{code}→{r.headers.get('Location', '?')}]")
+            elif code >= 400:
+                broken.append(f"{u} [{code}]")
         except requests.RequestException as e:
             broken.append(f"{u} [{e}]")
+    broken_res = (CheckResult("internal_links_not_broken", "seo", FAIL,
+                              f"{len(broken)}/{len(sample)} broken: {broken[0]}")
+                  if broken else
+                  CheckResult("internal_links_not_broken", "seo", PASS,
+                              f"{len(sample)} sampled, none broken"))
+    redir_res = (CheckResult("internal_links_not_redirecting", "seo", WARN,
+                             f"{len(redirected)}/{len(sample)} go through redirect: {redirected[0]}")
+                 if redirected else
+                 CheckResult("internal_links_not_redirecting", "seo", PASS,
+                             f"{len(sample)} sampled, none redirect"))
+    return [broken_res, redir_res], None
+
+
+def check_canonical_not_redirect(s: Site) -> CheckResult:
+    link = s.soup.find("link", rel=lambda v: v and "canonical" in v)
+    href = (link.get("href") or "").strip() if link else ""
+    if not href:
+        return CheckResult("canonical_not_redirect", "seo", INFO, "no canonical tag")
+    try:
+        r = s.session.head(href, timeout=TIMEOUT, allow_redirects=False,
+                           headers={"User-Agent": UA})
+        if r.status_code in (403, 405):
+            r = fetch(s.session, href, allow_redirects=False)
+    except requests.RequestException as e:
+        return CheckResult("canonical_not_redirect", "seo", WARN, f"{href}: {e}")
+    if r.status_code == 200:
+        return CheckResult("canonical_not_redirect", "seo", PASS, f"200 {href}")
+    if r.status_code in (301, 302, 303, 307, 308):
+        return CheckResult("canonical_not_redirect", "seo", FAIL,
+                           f"canonical redirects: {href} → {r.headers.get('Location')}")
+    return CheckResult("canonical_not_redirect", "seo", WARN, f"{r.status_code} {href}")
+
+
+def check_page_response_time(s: Site) -> CheckResult:
+    ms = int(s.response.elapsed.total_seconds() * 1000)
+    if ms >= SLOW_PAGE_FAIL_MS:
+        return CheckResult("page_response_time", "perf", FAIL, f"{ms} ms (very slow)")
+    if ms >= SLOW_PAGE_WARN_MS:
+        return CheckResult("page_response_time", "perf", WARN, f"{ms} ms")
+    return CheckResult("page_response_time", "perf", PASS, f"{ms} ms")
+
+
+def check_html_size(s: Site) -> CheckResult:
+    size = len(s.response.content)
+    kb = size / 1024
+    if size >= HTML_SIZE_FAIL:
+        return CheckResult("html_size", "perf", FAIL, f"{kb:.0f} KB (>2 MB)")
+    if size >= HTML_SIZE_WARN:
+        return CheckResult("html_size", "perf", WARN, f"{kb:.0f} KB (>500 KB)")
+    return CheckResult("html_size", "perf", PASS, f"{kb:.0f} KB")
+
+
+def _asset_size(session: requests.Session, url: str) -> tuple[Optional[int], Optional[int]]:
+    """Return (status_code, bytes) for an asset. bytes=None if Content-Length absent."""
+    try:
+        r = session.head(url, timeout=TIMEOUT, allow_redirects=True,
+                         headers={"User-Agent": UA})
+        if r.status_code in (403, 405):
+            r = session.get(url, timeout=TIMEOUT, allow_redirects=True, stream=True,
+                            headers={"User-Agent": UA})
+            r.close()
+    except requests.RequestException:
+        return None, None
+    cl = r.headers.get("Content-Length")
+    return r.status_code, int(cl) if cl and cl.isdigit() else None
+
+
+def check_image_sizes(s: Site) -> CheckResult:
+    imgs = [urljoin(s.final_url, i["src"]) for i in s.soup.find_all("img", src=True)]
+    imgs = list(dict.fromkeys(imgs))[:ASSET_SAMPLE]
+    if not imgs:
+        return CheckResult("image_sizes", "perf", INFO, "no <img> on page")
+    too_big: list[str] = []
+    warn_big: list[str] = []
+    unknown = 0
+    for u in imgs:
+        code, size = _asset_size(s.session, u)
+        if size is None:
+            unknown += 1
+            continue
+        if size >= IMAGE_SIZE_FAIL:
+            too_big.append(f"{u} ({size // 1024} KB)")
+        elif size >= IMAGE_SIZE_WARN:
+            warn_big.append(f"{u} ({size // 1024} KB)")
+    if too_big:
+        return CheckResult("image_sizes", "perf", FAIL,
+                           f"{len(too_big)} image(s) >500 KB: {too_big[0]}")
+    if warn_big:
+        return CheckResult("image_sizes", "perf", WARN,
+                           f"{len(warn_big)} image(s) >200 KB: {warn_big[0]}")
+    if unknown == len(imgs):
+        return CheckResult("image_sizes", "perf", INFO,
+                           "no Content-Length on sampled images")
+    return CheckResult("image_sizes", "perf", PASS,
+                       f"{len(imgs) - unknown}/{len(imgs)} sampled images under 200 KB")
+
+
+def check_css_sizes(s: Site) -> CheckResult:
+    css = [urljoin(s.final_url, l["href"])
+           for l in s.soup.find_all("link", rel=lambda v: v and "stylesheet" in v, href=True)]
+    css = list(dict.fromkeys(css))[:ASSET_SAMPLE]
+    if not css:
+        return CheckResult("css_sizes", "perf", INFO, "no external <link rel=stylesheet>")
+    big: list[str] = []
+    for u in css:
+        code, size = _asset_size(s.session, u)
+        if size and size >= CSS_SIZE_WARN:
+            big.append(f"{u} ({size // 1024} KB)")
+    if big:
+        return CheckResult("css_sizes", "perf", WARN,
+                           f"{len(big)} CSS file(s) >100 KB: {big[0]}")
+    return CheckResult("css_sizes", "perf", PASS, f"{len(css)} CSS file(s) all <100 KB")
+
+
+def check_js_assets_reachable(s: Site) -> CheckResult:
+    js = [urljoin(s.final_url, sc["src"])
+          for sc in s.soup.find_all("script", src=True)]
+    js = list(dict.fromkeys(js))[:ASSET_SAMPLE]
+    if not js:
+        return CheckResult("js_assets_reachable", "perf", INFO, "no external <script src>")
+    broken: list[str] = []
+    huge: list[str] = []
+    for u in js:
+        code, size = _asset_size(s.session, u)
+        if code is None or code >= 400:
+            broken.append(f"{u} [{code}]")
+        elif size and size >= JS_SIZE_WARN:
+            huge.append(f"{u} ({size // 1024} KB)")
     if broken:
-        return CheckResult("internal_links_reachable", "seo", WARN,
-                           f"{len(broken)}/{len(sample)} broken: {broken[0]}")
-    return CheckResult("internal_links_reachable", "seo", PASS, f"{len(sample)} links OK")
+        return CheckResult("js_assets_reachable", "perf", FAIL,
+                           f"{len(broken)}/{len(js)} JS files broken: {broken[0]}")
+    if huge:
+        return CheckResult("js_assets_reachable", "perf", WARN,
+                           f"{len(huge)} JS file(s) >300 KB: {huge[0]}")
+    return CheckResult("js_assets_reachable", "perf", PASS, f"{len(js)} JS files all 2xx")
 
 
 def check_llms_txt(s: Site) -> CheckResult:
@@ -688,13 +862,17 @@ CheckFn = Callable[[Site], CheckResult]
 CHECKS: list[CheckFn] = [
     check_https_reachable, check_http_to_https, check_www_apex, check_hsts,
     check_content_type, check_x_robots,
-    check_title, check_meta_description, check_canonical, check_h1, check_html_lang,
+    check_title, check_meta_description, check_canonical, check_canonical_not_redirect,
+    check_h1, check_html_lang,
     check_viewport, check_favicon, check_apple_touch_icon, check_images_alt, check_open_graph,
     check_twitter_card, check_json_ld, check_hreflang,
-    check_robots_txt, check_internal_links,
+    check_robots_txt, check_outgoing_links_present,
     check_llms_txt, check_llms_full_txt, check_ai_crawlers,
     check_citable_facts, check_faq_schema,
-    check_images_dimensions, check_render_blocking, check_lcp_hints,
+    check_page_response_time, check_html_size,
+    check_images_dimensions, check_image_sizes,
+    check_css_sizes, check_js_assets_reachable,
+    check_render_blocking, check_lcp_hints,
 ]
 
 
@@ -721,6 +899,8 @@ def run_all(url: str) -> list[CheckResult]:
     sm_result, locs = check_sitemap(site)
     results.append(sm_result)
     results.append(check_sitemap_urls_reachable(site, locs))
+    link_results, _ = _probe_internal_links(site)
+    results.extend(link_results)
     order = {"shared": 0, "seo": 1, "llm": 2, "perf": 3}
     results.sort(key=lambda r: (order.get(r.category, 9), r.check))
     return results

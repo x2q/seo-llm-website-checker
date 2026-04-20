@@ -1,6 +1,6 @@
 # seo-llm-website-checker
 
-Single-file Python CLI that runs ~30 checks on a live website and reports SEO + LLM-readiness issues as a markdown table (or JSON). No headless browser — just HTTP + HTML parsing.
+Single-file Python CLI that runs ~40 checks on a live website and reports SEO + LLM-readiness issues as a markdown table (or JSON). Covers the same ground as an Ahrefs Site Audit for a single URL — slow pages, broken links, redirect chains, canonical/sitemap hygiene, oversized assets, plus LLM-specific signals (`llms.txt`, AI crawler access, citable facts). No headless browser — just HTTP + HTML parsing.
 
 ## Install
 
@@ -32,6 +32,7 @@ python check.py https://example.com --fail-on warn   # exit 1 on any WARN or FAI
 
 - `<title>` (15–65 chars), `<meta name=description>` (50–160 chars)
 - `<link rel=canonical>` present, absolute https, matches the fetched URL (path percent-encoded)
+- **Canonical URL itself returns 200 directly** (doesn't redirect — the Ahrefs "canonical points to redirect" check)
 - Single non-empty `<h1>`, `<html lang>` (warns if `.dk` site isn't `da`)
 - `<meta name=viewport>` with `width=device-width`
 - **favicon** and **apple-touch-icon** both resolve 200 (apple-touch-icon drives iMessage/iOS share previews)
@@ -41,7 +42,9 @@ python check.py https://example.com --fail-on warn   # exit 1 on any WARN or FAI
 - JSON-LD structured data parses, traverses `@graph`, contains at least one useful type (Organization, WebSite, LocalBusiness, Article, FAQPage, Product, …), rejects JSON-LD loaded via `src=`
 - `hreflang` reciprocity + `x-default` when present
 - `sitemap.xml`: valid XML, follows `<sitemapindex>` one level, all URLs https + percent-encoded, `<lastmod>` present, sampled URLs return 200 and self-canonical
-- Sample of internal links returns 200
+- **Page has outgoing links** (FAIL if zero — dead-end for crawlers)
+- **Internal links not broken** (sample of 10 — FAIL on 4xx/5xx)
+- **Internal links not going through redirects** (sample of 10 — WARN on 3xx, the Ahrefs "page has links to redirect" check)
 
 ### LLM-readiness
 
@@ -53,7 +56,12 @@ python check.py https://example.com --fail-on warn   # exit 1 on any WARN or FAI
 
 ### Performance hints (static)
 
+- **Page response time** (WARN >2s, FAIL >5s — Ahrefs "slow page" proxy)
+- **HTML payload size** (WARN >500 KB, FAIL >2 MB)
 - All `<img>` have `width` + `height` (CLS)
+- **Image file sizes** — samples up to 10 images; WARN on any >200 KB, FAIL on >500 KB
+- **CSS file sizes** — WARN on any stylesheet >100 KB
+- **JS assets reachable** — HEAD on referenced `<script src>` files; FAIL on 4xx/5xx (closest static approximation of Ahrefs "broken JavaScript")
 - No dev CDNs (e.g. `cdn.tailwindcss.com`) in `<head>`
 - First `<img>` has `fetchpriority=high`/`loading=eager`, or a `<link rel=preload as=image>` is set (LCP)
 
