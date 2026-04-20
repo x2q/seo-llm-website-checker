@@ -177,12 +177,20 @@ def check_x_robots(s: Site) -> CheckResult:
 
 
 def check_title(s: Site) -> CheckResult:
-    t = s.soup.title.string.strip() if s.soup.title and s.soup.title.string else ""
-    if not t:
+    raw = s.soup.title.string if s.soup.title and s.soup.title.string else ""
+    if not raw.strip():
         return CheckResult("title_tag", "seo", FAIL, "no <title>")
-    if not (15 <= len(t) <= 65):
-        return CheckResult("title_tag", "seo", WARN, f"length {len(t)}: {t!r}")
-    return CheckResult("title_tag", "seo", PASS, f"{len(t)} chars: {t!r}")
+    # what browsers/Google actually render after whitespace collapse
+    normalized = re.sub(r"\s+", " ", raw).strip()
+    n = len(normalized)
+    if raw != normalized:
+        # embedded newline or run of whitespace — template bug
+        return CheckResult("title_tag", "seo", WARN,
+                           f"{n} chars but raw title has stray whitespace "
+                           f"(newline/indent) — fix your template: {normalized!r}")
+    if not (15 <= n <= 65):
+        return CheckResult("title_tag", "seo", WARN, f"length {n}: {normalized!r}")
+    return CheckResult("title_tag", "seo", PASS, f"{n} chars: {normalized!r}")
 
 
 def check_meta_description(s: Site) -> CheckResult:
