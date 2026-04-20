@@ -3055,34 +3055,46 @@ def render_markdown(url: str, site_wide: list[CheckResult],
     lines.append("")
     lines.extend(_render_table(site_wide))
 
-    # ── per-URL issue table ──
+    # build aligned, short URL paths for per-URL tables
+    base = url.rstrip("/")
+    shorts = {u: (u.replace(base, "") or "/") for u in urls}
+    url_w = max((len(s) for s in shorts.values()), default=3)
+
+    # ── per-URL issue digest (fixed-width monospace) ──
     lines.append("## Per-URL issues (WARN + FAIL only)")
-    lines.append("| URL | Check | Status | Detail |")
-    lines.append("|---|---|---|---|")
+    lines.append("")
+    lines.append("```")
+    header = f"{'URL'.ljust(url_w)}  {'Status'.ljust(6)}  {'Check'.ljust(32)}  Detail"
+    lines.append(header)
+    lines.append("-" * min(len(header), 120))
     any_issues = False
     for u in urls:
-        rs = per_url.get(u, [])
-        for r in rs:
+        short = shorts[u]
+        for r in per_url.get(u, []):
             if r.status in (WARN, FAIL):
                 any_issues = True
-                detail = r.message.replace("|", "\\|")
-                short = u.replace(url.rstrip("/"), "") or "/"
-                lines.append(f"| {short} | {r.check} | {ICON[r.status]} {r.status} | {detail[:140]} |")
+                icon = ICON[r.status]
+                detail = r.message.replace("\n", " ")[:100]
+                lines.append(f"{short.ljust(url_w)}  {icon} {r.status.ljust(4)}  {r.check.ljust(32)}  {detail}")
     if not any_issues:
-        lines.append("| _(none)_ | | | |")
+        lines.append("(none)")
+    lines.append("```")
     lines.append("")
 
-    # ── worst pages ──
+    # ── per-URL pass/warn/fail summary (fixed-width monospace) ──
     by_page: list[tuple[str, dict[str, int]]] = [(u, _counts(per_url.get(u, []))) for u in urls]
     worst = sorted(by_page, key=lambda x: (-x[1][FAIL], -x[1][WARN]))[:10]
     lines.append("## Per-URL summary")
-    lines.append("| URL | ✅ | 🟡 | 🔴 | ℹ️ |")
-    lines.append("|---|---|---|---|---|")
+    lines.append("")
+    lines.append("```")
+    lines.append(f"{'URL'.ljust(url_w)}   ✅   🟡   🔴   ℹ️")
+    lines.append("-" * (url_w + 24))
     for u, c in worst:
-        short = u.replace(url.rstrip("/"), "") or "/"
-        lines.append(f"| {short} | {c[PASS]} | {c[WARN]} | {c[FAIL]} | {c[INFO]} |")
+        short = shorts[u]
+        lines.append(f"{short.ljust(url_w)}  {c[PASS]:>3}  {c[WARN]:>3}  {c[FAIL]:>3}  {c[INFO]:>3}")
     if len(urls) > 10:
-        lines.append(f"| _… {len(urls) - 10} more URL(s) …_ | | | | |")
+        lines.append(f"… {len(urls) - 10} more URL(s) …")
+    lines.append("```")
     lines.append("")
 
     # ── aggregate ──
