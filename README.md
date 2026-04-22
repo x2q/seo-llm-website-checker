@@ -13,7 +13,12 @@ git clone https://github.com/x2q/seo-llm-website-checker
 cd seo-llm-website-checker
 pip install -r requirements.txt -r requirements-browser.txt
 playwright install chromium
+
+# single-URL audit (the default) — fast, covers the audited page
 python check.py https://example.com
+
+# whole-site audit — discover URLs via sitemap, crawl up to 50 pages
+python check.py https://example.com --crawl
 ```
 
 Skip the second install line and add `--no-browser` if you don't want the headless-Chromium runtime checks — the other 86 still work.
@@ -60,8 +65,8 @@ Live progress bar on stderr while running (auto-hides for pipes/CI):
 
 | Flag | Effect |
 |---|---|
-| `--single` | audit only the input URL (no crawl) |
-| `--max-urls N` | cap the crawl (default 50) |
+| `--crawl` | crawl the site (sitemap + homepage links). Default: single URL only |
+| `--max-urls N` | cap the crawl when `--crawl` is set (default 50) |
 | `--no-browser` | skip headless-Chromium checks (saves ~3s per URL) |
 | `--ads-deep` | scrape Meta Ad Library + Google Ads Transparency (needs `--browser`) |
 | `--no-progress` | silence the stderr bar |
@@ -93,7 +98,7 @@ Checks are partitioned into **site-wide** (run once on the homepage — results 
 
 #### SEO (28)
 
-`title_tag`, `meta_description`, `canonical`, `canonical_not_redirect`, `meta_robots_indexable`, `page_indexable_by_google`, `soft_404`, `h1_single`, `html_lang`, `viewport_meta`, `viewport_accessible`, `favicon`, `apple_touch_icon`, `images_alt`, `open_graph`, `twitter_card`, `json_ld_structured_data`, `hreflang`, `outgoing_links_present`, `internal_links_not_broken`, `internal_links_not_redirecting`, `external_link_rel_safety`, `descriptive_link_text`, `text_to_html_ratio`, `breadcrumb_schema`, `product_schema`, `citable_facts`, `faq_schema_if_faq_visible`
+`title_tag`, `meta_description`, `canonical`, `canonical_not_redirect`, `meta_robots_indexable`, `page_indexable_by_google`, `soft_404`, `h1_single`, `html_lang`, `viewport_meta`, `viewport_accessible`, `favicon`, `apple_touch_icon`, `images_alt`, `open_graph`, `twitter_card`, `json_ld_structured_data`, `hreflang`, `outgoing_links_present`, `internal_links_not_broken`, `internal_links_not_redirecting`, `external_link_rel_safety`, `descriptive_link_text`, `text_to_html_ratio`, `breadcrumb_schema`, `product_schema`, `citable_facts`, `faq_schema_if_faq_visible`, `broken_internal_links_scan`, `broken_external_links_scan`, `social_presence`
 
 #### Performance (15)
 
@@ -110,6 +115,12 @@ Checks are partitioned into **site-wide** (run once on the homepage — results 
 #### Privacy (1)
 
 `cookie_flags`
+
+### Fast link-scan + social-presence checks
+
+- **`broken_internal_links_scan`** — parallel HEAD (16 workers) on every internal `<a href>` on the audited page, cap 500. FAIL on any 4xx/5xx or connection error; reports the first broken URL.
+- **`broken_external_links_scan`** — same, for external hrefs. Cap 200, 8 workers (gentler on third parties). Timeouts are WARN (flaky host) rather than FAIL.
+- **`social_presence`** — scans all `<a href>` for links to LinkedIn, Facebook, Instagram, YouTube, X/Twitter, TikTok, Pinterest, GitHub, Discord, Bluesky, Threads, Mastodon, Spotify. Excludes UI paths (e.g. `facebook.com/sharer`, `youtube.com/watch`). PASS with the list of detected accounts; INFO if none found.
 
 ### Ads, tracking, martech — how they work
 

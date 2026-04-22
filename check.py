@@ -2032,6 +2032,142 @@ def _outgoing_links(s: Site) -> tuple[list[str], list[str]]:
     return internal, external
 
 
+# ---------- Fast broken-link scanners + social-presence detector ----------
+
+_LINK_SCAN_CAP_INTERNAL = 500
+_LINK_SCAN_CAP_EXTERNAL = 200
+
+
+def _head_status(session: requests.Session, url: str, timeout: float = 8.0
+                 ) -> tuple[str, Optional[int], Optional[str]]:
+    """Return (url, status_code, error_str). None status means hard error."""
+    try:
+        r = session.head(url, timeout=timeout, allow_redirects=True,
+                         headers={"User-Agent": UA})
+        if r.status_code in (403, 405):
+            # some servers don't like HEAD — try a cheap GET
+            r = session.get(url, timeout=timeout, allow_redirects=True,
+                            stream=True, headers={"User-Agent": UA})
+            r.close()
+        return url, r.status_code, None
+    except requests.RequestException as e:
+        return url, None, type(e).__name__
+
+
+def _scan_links(session: requests.Session, urls: list[str],
+                workers: int = 16) -> list[tuple[str, Optional[int], Optional[str]]]:
+    if not urls:
+        return []
+    results: list[tuple[str, Optional[int], Optional[str]]] = []
+    with ThreadPoolExecutor(max_workers=min(workers, max(2, len(urls)))) as ex:
+        for u, code, err in ex.map(lambda x: _head_status(session, x), urls):
+            results.append((u, code, err))
+    return results
+
+
+def check_broken_internal_links_scan(s: Site) -> CheckResult:
+    """Fast parallel HEAD of every internal <a href> on the page (cap 500)."""
+    internal, _ = _outgoing_links(s)
+    urls = internal[:_LINK_SCAN_CAP_INTERNAL]
+    if not urls:
+        return CheckResult("broken_internal_links_scan", "seo", INFO,
+                           "no internal links on page")
+    results = _scan_links(s.session, urls)
+    broken = [(u, code, err) for u, code, err in results
+              if err or (code is not None and code >= 400)]
+    capped = " (capped at 500)" if len(internal) > _LINK_SCAN_CAP_INTERNAL else ""
+    if broken:
+        first_u, first_code, first_err = broken[0]
+        return CheckResult("broken_internal_links_scan", "seo", FAIL,
+                           f"{len(broken)}/{len(urls)} broken{capped}: "
+                           f"{first_u} [{first_code or first_err}]")
+    return CheckResult("broken_internal_links_scan", "seo", PASS,
+                       f"{len(urls)} internal link(s){capped} all 2xx/3xx")
+
+
+def check_broken_external_links_scan(s: Site) -> CheckResult:
+    """Fast parallel HEAD of every external <a href> on the page (cap 200)."""
+    _, external = _outgoing_links(s)
+    urls = external[:_LINK_SCAN_CAP_EXTERNAL]
+    if not urls:
+        return CheckResult("broken_external_links_scan", "seo", INFO,
+                           "no external links on page")
+    # fewer workers for external — we don't want to hammer a single third party
+    results = _scan_links(s.session, urls, workers=8)
+    broken: list[tuple[str, Optional[int], Optional[str]]] = []
+    timed_out: list[str] = []
+    for u, code, err in results:
+        if err in ("ConnectTimeout", "ReadTimeout", "Timeout"):
+            timed_out.append(u)
+            continue
+        if err or (code is not None and code >= 400):
+            broken.append((u, code, err))
+    capped = " (capped at 200)" if len(external) > _LINK_SCAN_CAP_EXTERNAL else ""
+    if broken:
+        first_u, first_code, first_err = broken[0]
+        msg = (f"{len(broken)}/{len(urls)} broken{capped}: "
+               f"{first_u} [{first_code or first_err}]")
+        if timed_out:
+            msg += f"; {len(timed_out)} timed out"
+        return CheckResult("broken_external_links_scan", "seo", FAIL, msg)
+    if timed_out:
+        return CheckResult("broken_external_links_scan", "seo", WARN,
+                           f"{len(timed_out)}/{len(urls)} timed out{capped} "
+                           "(could be flaky hosts, not necessarily broken)")
+    return CheckResult("broken_external_links_scan", "seo", PASS,
+                       f"{len(urls)} external link(s){capped} all 2xx/3xx")
+
+
+# Social-media platforms: (name, URL pattern, excluded slug set)
+SOCIAL_PLATFORMS: list[tuple[str, str, set[str]]] = [
+    ("linkedin", r"https?://(?:[a-z]+\.)?linkedin\.com/(?:company|in|school|showcase)/([^/?#\"']+)",
+     set()),
+    ("facebook", r"https?://(?:www\.)?facebook\.com/([^/?#\"']+)",
+     {"sharer", "share", "tr", "pages", "plugins", "dialog", "privacy", "help",
+      "login", "signup", "policies", "people"}),
+    ("instagram", r"https?://(?:www\.)?instagram\.com/([^/?#\"']+)",
+     {"p", "reel", "explore", "accounts", "direct"}),
+    ("youtube", r"https?://(?:www\.)?youtube\.com/(?:c/|channel/|@|user/)([^/?#\"']+)",
+     {"watch", "embed", "shorts"}),
+    ("twitter_x", r"https?://(?:www\.)?(?:twitter|x)\.com/([^/?#\"']+)",
+     {"share", "intent", "i", "home", "search", "settings", "hashtag"}),
+    ("tiktok", r"https?://(?:www\.)?tiktok\.com/@([^/?#\"']+)", set()),
+    ("pinterest", r"https?://(?:[a-z]+\.)?pinterest\.[a-z.]+/([^/?#\"']+)",
+     {"pin", "search"}),
+    ("github", r"https?://(?:www\.)?github\.com/([^/?#\"']+)",
+     {"search", "topics", "trending", "explore", "collections", "events",
+      "sponsors", "marketplace", "notifications", "issues", "pulls"}),
+    ("discord", r"https?://discord\.(?:gg|com/invite)/([^/?#\"']+)", set()),
+    ("bluesky", r"https?://(?:www\.)?bsky\.app/profile/([^/?#\"']+)", set()),
+    ("mastodon", r"https?://mastodon\.(?:social|online)/@([^/?#\"']+)", set()),
+    ("threads", r"https?://(?:www\.)?threads\.net/@([^/?#\"']+)", set()),
+    ("spotify", r"https?://open\.spotify\.com/(?:artist|show|user)/([^/?#\"']+)", set()),
+]
+
+
+def check_social_presence(s: Site) -> CheckResult:
+    """Detect linked social-media accounts from <a href> on the page."""
+    html = s.response.text
+    found: dict[str, str] = {}
+    for platform, pattern, excludes in SOCIAL_PLATFORMS:
+        for m in re.finditer(pattern, html, re.I):
+            slug = m.group(1)
+            if slug.lower() in excludes:
+                continue
+            if slug.lower().endswith((".jpg", ".jpeg", ".png", ".gif", ".svg",
+                                      ".mp4", ".webp")):
+                continue
+            if platform not in found:
+                found[platform] = slug
+            break
+    if not found:
+        return CheckResult("social_presence", "seo", INFO,
+                           "no social-media links detected")
+    items = [f"{p}:{slug}" for p, slug in sorted(found.items())]
+    return CheckResult("social_presence", "seo", PASS,
+                       f"{len(found)} social channel(s): {', '.join(items)}")
+
+
 def check_outgoing_links_present(s: Site) -> CheckResult:
     internal, external = _outgoing_links(s)
     total = len(internal) + len(external)
@@ -3262,6 +3398,8 @@ CHECKS: list[CheckFn] = [
     check_outgoing_links_present, check_external_link_safety,
     check_descriptive_link_text, check_text_to_html_ratio,
     check_breadcrumb_schema, check_product_schema,
+    check_broken_internal_links_scan, check_broken_external_links_scan,
+    check_social_presence,
     # llm
     check_llms_txt, check_llms_full_txt, check_ai_crawlers,
     check_citable_facts, check_faq_schema,
@@ -3698,10 +3836,13 @@ def main(argv: list[str]) -> int:
                     help="disable the headless-browser audit (it is ON by default; "
                          "needs `pip install -r requirements-browser.txt && "
                          "playwright install chromium` the first time)")
+    ap.add_argument("--crawl", action="store_true",
+                    help="crawl the site (discover URLs via sitemap / homepage links). "
+                         "Default: audit only the input URL.")
     ap.add_argument("--single", action="store_true",
-                    help="audit only the input URL (skip sitemap/link crawl)")
+                    help=argparse.SUPPRESS)  # kept for back-compat; now the default
     ap.add_argument("--max-urls", type=int, default=50,
-                    help="max URLs to audit when crawling (default 50)")
+                    help="max URLs to audit when --crawl is set (default 50)")
     ap.add_argument("--ads-deep", action="store_true",
                     help="scrape Meta Ad Library + Google Ads Transparency Center "
                          "for active-ad counts (best-effort; requires --browser)")
@@ -3716,7 +3857,7 @@ def main(argv: list[str]) -> int:
             url,
             progress=not args.no_progress,
             browser=not args.no_browser,
-            single=args.single,
+            single=not args.crawl,
             max_urls=args.max_urls,
             ads_deep=args.ads_deep,
         )
@@ -3732,7 +3873,7 @@ def main(argv: list[str]) -> int:
             "per_url": {u: [asdict(r) for r in rs] for u, rs in per_url.items()},
         }
         print(json.dumps(out, indent=2))
-    elif args.single:
+    elif not args.crawl:
         print(render_single(url, site_wide, per_url))
     else:
         print(render_markdown(url, site_wide, per_url, urls))
